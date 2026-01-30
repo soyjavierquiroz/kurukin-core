@@ -1,0 +1,80 @@
+.k-dashboard {
+    max-width: 480px;
+    margin: 40px auto;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    color: #1d1d1f;
+}
+.k-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 20px;
+}
+.k-header h2 { margin: 0; font-size: 22px; font-weight: 600; }
+.k-badge { font-size: 13px; font-weight: 500; color: #86868b; }
+
+.k-card {
+    background: #fff;
+    border-radius: 18px;
+    box-shadow: 0 4px 24px rgba(0,0,0,0.06);
+    padding: 40px;
+    text-align: center;
+    border: 1px solid #f5f5f7;
+}
+
+.k-state h3 { margin-top: 0; font-size: 20px; }
+.k-instruction { color: #86868b; font-size: 14px; margin-bottom: 25px; }
+
+.k-qr-img {
+    width: 260px;
+    height: 260px;
+    border-radius: 12px;
+    border: 1px solid #f0f0f0;
+    margin-bottom: 20px;
+}
+
+.k-icon { font-size: 48px; margin-bottom: 15px; }
+
+.k-btn {
+    padding: 12px 24px;
+    border-radius: 99px;
+    border: none;
+    font-size: 14px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.2s;
+}
+.k-btn-secondary { background: #0071e3; color: white; }
+.k-btn-secondary:hover { background: #0077ed; }
+
+.k-btn-text { background: transparent; color: #ff3b30; margin-top: 10px; }
+.k-btn-text:hover { background: #fff2f2; }
+
+.k-loading-qr {
+    height: 260px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    background: #fbfbfd;
+    border-radius: 12px;
+    color: #86868b;
+}
+
+.k-spinner {
+    border: 3px solid rgba(0,0,0,0.1);
+    border-top: 3px solid #0071e3;
+    border-radius: 50%;
+    width: 30px; height: 30px;
+    animation: spin 1s linear infinite;
+    margin: 0 auto 15px auto;
+}
+.k-spinner-small {
+    border: 2px solid rgba(0,0,0,0.1);
+    border-top: 2px solid #0071e3;
+    border-radius: 50%;
+    width: 20px; height: 20px;
+    animation: spin 1s linear infinite;
+    margin-bottom: 10px;
+}
+@keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }

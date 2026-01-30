@@ -1,35 +1,36 @@
 # 🧠 Kurukin Core (SaaS Engine)
 
-> **Versión:** 1.3.0  
-> **Estado:** 🟢 Producción / Estable  
+> **Versión:** 1.8.0
+> **Estado:** 🟢 Producción / Estable
 > **Arquitectura:** User-Centric Multi-Tenancy
+> **Frontend:** React (WP Element)
 
 ## 📖 Descripción del Proyecto
 
-**Kurukin Core** es el motor central del SaaS **Kurukin IA**. Este plugin de WordPress actúa como el "cerebro orquestador" que vincula la gestión de usuarios y pagos (WordPress + MemberPress) con la infraestructura de IA y mensajería (n8n + Evolution API + OpenAI).
+**Kurukin Core** es el motor central del SaaS **Kurukin IA**. Este plugin transforma WordPress en una plataforma de orquestación de IA, actuando como puente entre la gestión de usuarios (MemberPress), la infraestructura de mensajería (Evolution API v2) y la lógica de negocio (n8n).
 
-Su función principal es transformar una instalación de WordPress en una plataforma SaaS automatizada, donde cada usuario registrado obtiene automáticamente una "Instancia de Bot" personalizada, protegida por su estado de suscripción.
+A diferencia de las versiones anteriores, la v1.8.0 introduce un **Frontend Dashboard** basado en React, permitiendo a los usuarios finales escanear su código QR y gestionar su conexión de WhatsApp sin jamás tocar el panel de administración de WordPress.
 
 ---
 
 ## 🏗️ Arquitectura del Sistema
 
-El sistema opera bajo un modelo de **Multi-tenencia centrada en el usuario**:
+El sistema opera bajo un modelo híbrido de **Gestión + Conectividad**:
 
-1.  **Identity Provider:** WordPress maneja la identidad (`user_login`) y autenticación.
-2.  **Payment Gatekeeper:** MemberPress controla el acceso. Si no hay pago, la API devuelve `402 Payment Required`.
-3.  **Bot Provisioning:** Al registrarse un usuario, este plugin crea automáticamente un Custom Post Type (`saas_instance`) vinculado a su cuenta.
-4.  **Configuration Hub:** n8n consulta este plugin para saber cómo debe comportarse el bot de cada cliente (Prompt, Modelo, Vertical de Negocio).
+1. **Identity & Access:** WordPress + MemberPress gestionan quién puede tener un bot.
+2. **Smart Provisioning:** El sistema "auto-sana". Si un usuario pide un QR y su instancia no existe en Evolution API, el núcleo la crea, configura y conecta en tiempo real.
+3. **Frontend App:** Una SPA (Single Page Application) ligera incrustada mediante shortcode para la vinculación de WhatsApp.
+4. **AI Context Hub:** Centraliza Prompts, Voz (ElevenLabs) y Datos de Negocio (RAG Lite) para enviarlos a n8n en una sola petición.
 
 ```mermaid
-graph LR
-    A[Usuario Paga en WP] -->|Hook| B(Kurukin Core)
-    B -->|Crea| C{Instancia Bot}
-    D[Cliente en WhatsApp] -->|Mensaje| E[Evolution API]
-    E -->|Webhook| F[n8n Workflow]
-    F -->|GET /config| B
-    B -->|Valida MemberPress| F
-    F -->|Si Activo| G[OpenAI GPT-4]
+graph TD
+    User((Usuario Final)) -->|1. Escanea QR| Front[React App [kurukin_connect]]
+    Front -->|2. REST API| WP[Kurukin Core]
+    WP -->|3. Auto-Create/Connect| Evo[Evolution API v2]
+    Evo -->|4. Webhook Mensaje| N8N[n8n Workflow]
+    N8N -->|5. GET /config| WP
+    WP -->|6. JSON Context (RAG+Voz)| N8N
+    N8N -->|7. Respuesta IA| Evo
 
 ```
 
@@ -37,15 +38,26 @@ graph LR
 
 ## 🚀 Características Principales
 
-* **Auto-Provisioning:** Creación automática de instancias de bot basadas en el `user_login` del usuario al registrarse.
-* **MemberPress Integration:** Bloqueo nativo de la API. Si la membresía caduca, el bot deja de responder automáticamente.
-* **Seguridad de Grado Militar:**
-* Las API Keys de OpenAI se almacenan encriptadas (AES-256-CBC) en la base de datos.
-* Comunicación API protegida por Headers personalizados y validación de Hash.
+### 🔌 Conectividad & Frontend
+
+* **Dashboard React (Shortcode):** Interfaz moderna tipo "Stripe" para conectar WhatsApp. Maneja estados de carga, errores de red y reintentos automáticos.
+* Uso: `[kurukin_connect]`
 
 
-* **API REST Personalizada:** Endpoint ligero y optimizado para consultas de alta velocidad desde n8n.
-* **Carga Diferida:** Arquitectura optimizada para evitar condiciones de carrera (Race Conditions) en el arranque de WordPress.
+* **Smart QR Generation:** El sistema detecta si la instancia existe. Si no, la crea, configura los webhooks y genera el QR en un solo flujo transparente para el usuario.
+* **Zombie Killer:** Lógica de "Reset" que elimina instancias corruptas, crea una nueva y genera un nuevo QR con un solo clic.
+
+### 🧠 Inteligencia & Contexto
+
+* **RAG Lite (Contexto de Negocio):** Campos estructurados para definir *Perfil de Empresa*, *Servicios* y *Reglas*. Estos se inyectan dinámicamente en el prompt del sistema.
+* **Módulo de Voz (ElevenLabs):** Configuración nativa para TTS (Text-to-Speech), incluyendo validación de API Key y selectores de Voice ID.
+* **Sharding Ready:** Campos de arquitectura (`cluster_node`, `business_vertical`) preparados para enrutamiento de tráfico en entornos de múltiples servidores.
+
+### 🛡️ Seguridad & Estabilidad (DevOps)
+
+* **Fail Fast Validation:** Botones AJAX en el admin para probar credenciales (OpenAI/ElevenLabs) antes de guardar. Evita errores en tiempo de ejecución.
+* **Encriptación AES-256:** Todas las API Keys se almacenan encriptadas en la base de datos.
+* **Error Handling:** Controladores API blindados con `try/catch` para evitar errores fatales (Error 500) y logs detallados en Docker.
 
 ---
 
@@ -53,106 +65,104 @@ graph LR
 
 ### 1. Requisitos del Servidor
 
-* PHP 8.0 o superior.
+* PHP 8.0+.
 * WordPress 6.0+.
-* Extensiones PHP: `openssl`.
-* (Opcional pero recomendado) MemberPress instalado y activo.
+* **Evolution API v2** desplegado y accesible internamente.
 
 ### 2. Constantes en `wp-config.php`
 
-Para que el plugin funcione, debes definir las siguientes constantes en tu archivo de configuración o en tu entorno Docker:
-
 ```php
-// Llave maestra para encriptar datos en la DB
-define('KURUKIN_ENCRYPTION_KEY', 'tu_clave_super_secreta_32_caracteres');
+// Seguridad
+define('KURUKIN_ENCRYPTION_KEY', 'tu_clave_super_secreta_32_chars');
+define('KURUKIN_API_SECRET', 'token_compartido_seguro_n8n');
 
-// Token compartido para validar peticiones desde n8n
-define('KURUKIN_API_SECRET', 'token_compartido_seguro_n8n_wp_2026');
+// Configuración Evolution (Opcional, tiene fallbacks internos)
+define('KURUKIN_EVOLUTION_GLOBAL_KEY', 'cdfedf0ae18a2b08cdd180823fad884d');
 
 ```
+
+---
+
+## 📲 Uso del Frontend (Cliente Final)
+
+Para mostrar el panel de conexión al usuario, crea una página en WordPress y pega el siguiente shortcode:
+
+```text
+[kurukin_connect]
+
+```
+
+*Nota: El usuario debe haber iniciado sesión. Si no, verá un mensaje de advertencia.*
 
 ---
 
 ## 🔌 Documentación de API (Para n8n)
 
-El plugin expone un endpoint REST para obtener la configuración del bot en tiempo real.
+**Endpoint:** `GET /wp-json/kurukin/v1/config`
 
-### Obtener Configuración de Instancia
+**Auth:** Header `x-kurukin-secret`
 
-**Endpoint:**
-`GET /wp-json/kurukin/v1/config`
+### Respuesta JSON (Modelo v1.8)
 
-**Headers Requeridos:**
-| Header | Valor | Descripción |
-| :--- | :--- | :--- |
-| `x-kurukin-secret` | `{{KURUKIN_API_SECRET}}` | Token definido en wp-config |
-
-**Parámetros (Query Param):**
-| Parámetro | Tipo | Descripción |
-| :--- | :--- | :--- |
-| `instance_id` | `string` | El **username** del usuario en WordPress (ej: `cliente_pyme_01`) |
-
-### Respuestas
-
-#### ✅ 200 OK (Activo y Pagado)
+El payload ahora incluye configuración de enrutamiento, cerebro IA, voz y datos de negocio.
 
 ```json
 {
   "status": "success",
   "router_logic": {
-    "workflow_mode": "catalog",
-    "version": "1.0",
-    "plan_status": "active"
+    "version": "1.3",
+    "plan_status": "active",
+    "business_vertical": "real_estate",
+    "cluster_node": "alpha-01"
   },
   "ai_brain": {
     "provider": "openai",
-    "api_key": "sk-proj-....",
+    "api_key": "sk-proj-...",
     "model": "gpt-4o",
-    "system_prompt": "Eres un asistente experto en ventas..."
+    "system_prompt": "Eres un asistente..."
   },
-  "business_data": []
+  "voice_config": {
+    "provider": "elevenlabs",
+    "enabled": true,
+    "api_key": "xi-...",
+    "voice_id": "JBFqnCBsd6RMkjVDRZzb",
+    "model_id": "eleven_multilingual_v2"
+  },
+  "business_data": [
+    {
+      "category": "COMPANY_PROFILE",
+      "content": "Somos una inmobiliaria líder..."
+    },
+    {
+      "category": "SERVICES_LIST",
+      "content": "- Venta de casas\n- Alquileres"
+    }
+  ]
 }
 
 ```
-
-#### ⛔ 402 Payment Required
-
-El usuario existe pero su suscripción en MemberPress ha caducado o no existe.
-
-```json
-{
-  "code": "402",
-  "message": "Payment Required: Subscription Inactive",
-  "data": { "status": 402 }
-}
-
-```
-
-#### ⛔ 403 Forbidden
-
-El `x-kurukin-secret` es incorrecto.
-
-#### ⛔ 404 Not Found
-
-El usuario no existe en la base de datos.
 
 ---
 
-## 🛠️ Desarrollo
-
-### Estructura de Archivos
+## 🛠️ Estructura del Proyecto
 
 ```text
 kurukin-core/
-├── kurukin-core.php           # Entry Point & Loader
+├── kurukin-core.php                 # Loader & Constantes Globales
+├── assets/
+│   ├── css/
+│   │   └── connection-app.css       # Estilos Dashboard (Stripe-like)
+│   └── js/
+│       └── connection-app.js        # React App (QR Logic)
 ├── includes/
-│   ├── class-kurukin-fields.php       # Metaboxes & Admin UI
+│   ├── class-kurukin-fields.php     # Admin UI & Validadores AJAX
 │   ├── api/
-│   │   └── class-kurukin-api-controller.php  # REST API Logic
+│   │   ├── class-kurukin-api-controller.php        # Config Endpoint (n8n)
+│   │   └── class-kurukin-connection-controller.php # QR/Status Endpoint (React)
 │   ├── integrations/
-│   │   └── class-kurukin-memberpress.php     # User Auto-creation Logic
+│   │   └── class-kurukin-memberpress.php           # MemberPress Hooks
 │   └── services/
-│       └── class-kurukin-bridge.php          # Outbound Webhooks (Future Use)
+│       └── class-kurukin-bridge.php                # Webhooks Salientes
 
 ```
 
@@ -160,29 +170,23 @@ kurukin-core/
 
 ## 📜 Historial de Versiones (Changelog)
 
+### [1.8.0] - 2026-01-30 (Versión Actual)
+
+* **Feat:** Dashboard Frontend en React (`[kurukin_connect]`) con UX mejorada.
+* **Feat:** Lógica "Smart QR" que crea instancias en Evolution API v2 automáticamente si no existen.
+* **Feat:** Manejo de reintentos y timeouts en la generación de QR.
+* **Fix:** Solución a Fatal Error por carga de constantes.
+
+### [1.7.0] - 2026-01-30
+
+* **Feat:** Módulo "Fail Fast" para validar API Keys en el admin.
+* **Feat:** Soporte para Sharding (`cluster_node`) y Verticales de Negocio.
+* **Feat:** Integración de configuración para ElevenLabs (Voz).
+
 ### [1.3.0] - 2026-01-28
 
-* **Feat:** Integración completa con MemberPress.
-* **Feat:** Lógica de "Auto-create" al registrar usuarios.
-* **Feat:** El `instance_id` ahora se mapea directamente al `user_login`.
-
-### [1.2.1] - 2026-01-28
-
-* **Fix:** Solucionado error fatal por condición de carrera usando hook `rest_api_init`.
-* **Refactor:** Limpieza de código en el controlador API.
-
-### [1.0.0] - 2026-01-27
-
-* Versión inicial. CPT `saas_instance` y campos encriptados.
+* **Feat:** Integración base con MemberPress y CPT `saas_instance`.
 
 ---
-
-## 👨‍💻 Autor
 
 **Javier Quiroz** Lead Architect @ Kurukin IA
-
-GitHub: [@soyjavierquiroz](https://www.google.com/search?q=https://github.com/soyjavierquiroz)
-
----
-
-*Este software es propiedad privada y confidencial de Kurukin IA.*

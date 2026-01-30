@@ -1,7 +1,5 @@
 .DS_Store
-Thumbs.db
-node_modules/
-vendor/
-.vscode/
-.idea/
 *.log
+error_log
+node_modules/
+.vscode/
