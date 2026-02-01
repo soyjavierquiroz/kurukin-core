@@ -1,35 +1,37 @@
 # 🧠 Kurukin Core (SaaS Engine)
 
+![Version](https://img.shields.io/badge/version-2.6.0-blueviolet) ![PHP](https://img.shields.io/badge/php-%3E%3D7.4-blue) ![WP](https://img.shields.io/badge/wordpress-%3E%3D6.2-blue) ![Status](https://img.shields.io/badge/status-production-success)
+
 > **Arquitectura:** User-Centric Multi-Tenancy
 > **Frontend:** React (WP Element) + Tailwind CSS (Tokens)
-> **Backend:** WordPress REST API + Evolution API v2
+> **Backend:** WordPress REST API + Evolution API v2 (Service Layer)
 
 ## 📖 Descripción del Proyecto
 
 **Kurukin Core** es el motor central del SaaS **Kurukin IA**. Este plugin transforma WordPress en una plataforma de orquestación de IA, actuando como puente entre la gestión de usuarios (MemberPress), la infraestructura de mensajería (Evolution API v2) y la lógica de negocio (n8n).
 
-La versión actual introduce un **Frontend Dashboard** basado en React (`connection-app.js`), permitiendo a los usuarios finales escanear su código QR, gestionar su conexión de WhatsApp y configurar su "Cerebro IA" sin jamás tocar el panel de administración de WordPress.
+La versión actual (v2.6) introduce una arquitectura de **Servicios Desacoplados** y un **Frontend Dashboard** basado en React, permitiendo a los usuarios gestionar su conexión de WhatsApp con una experiencia de usuario (UX) nativa y responsiva.
 
 ---
 
 ## 🏗️ Arquitectura del Sistema
 
-El sistema opera bajo un modelo híbrido de **Gestión + Conectividad**:
+El sistema opera bajo un modelo híbrido de **Gestión + Conectividad + Servicios**:
 
-1. **Identity & Access:** WordPress + MemberPress gestionan la autenticación y los planes.
-2. **Smart Provisioning:** El sistema "auto-sana". Si un usuario solicita un QR y su instancia no existe en Evolution API, el núcleo la crea, configura los webhooks y conecta en tiempo real.
-3. **Frontend App:** Una SPA (Single Page Application) ligera incrustada mediante shortcode.
-4. **AI Context Hub:** Centraliza Prompts, Voz (ElevenLabs) y Datos de Negocio para enviarlos a n8n en una sola petición.
+1.  **Identity & Access:** WordPress + MemberPress gestionan la autenticación.
+2.  **Service Layer (Backend):** Abstracción total de lógica externa (Evolution API) y auditoría interna (Logger).
+3.  **Smart Provisioning:** El sistema "auto-sana". Si un usuario solicita un QR, el núcleo orquesta la creación y configuración en Evolution API sin intervención humana.
+4.  **AI Context Hub:** Centraliza Prompts, Voz (ElevenLabs) y Datos de Negocio para enviarlos a n8n en una sola petición serializada.
 
 ```mermaid
 graph TD
     User((Usuario Final)) -->|1. Escanea QR| Front[React App]
-    Front -->|2. REST API (WP)| WP[Kurukin Core]
-    WP -->|3. Auto-Create/Connect| Evo[Evolution API v2]
-    Evo -->|4. Webhook Mensaje| N8N[n8n Workflow]
-    N8N -->|5. GET /context| WP
-    WP -->|6. JSON Context (RAG+Voz)| N8N
-    N8N -->|7. Respuesta IA| Evo
+    Front -->|2. REST API (WP)| Controller[API Controller]
+    Controller -->|3. Delegate| Service[Evolution Service]
+    Service -->|4. HTTP Request (Internal Docker Network)| Evo[Evolution API v2]
+    Evo -->|5. Webhook| N8N[n8n Workflow]
+    N8N -->|6. GET /context| Controller
+    Controller -->|7. JSON Context| N8N
 
 ```
 
@@ -37,137 +39,33 @@ graph TD
 
 ## ⚙️ Requisitos del Sistema
 
-Para garantizar el funcionamiento de la encriptación y la comunicación con APIs externas:
-
 ### Servidor & Entorno
 
 * **PHP:** Versión **7.4** o superior (Recomendado 8.1+).
-* **WordPress:** Versión **6.2** o superior (Requerido para soporte completo de React/WP-Element).
-* **Extensiones PHP:** `cURL` (comunicación API), `OpenSSL` (encriptación de credenciales).
+* **WordPress:** Versión **6.2** o superior.
+* **Extensiones PHP:** `cURL` (comunicación API), `OpenSSL` (encriptación).
 
-### Infraestructura Externa
+### Infraestructura Externa (Docker)
 
-* **Evolution API v2:** Desplegado y accesible vía HTTP/HTTPS desde el servidor de WordPress.
-* **Redis (Opcional):** Recomendado para caché de objetos si hay alta concurrencia.
+* **Evolution API v2:** Accesible vía red interna (recomendado) o HTTP.
+* **Redis:** Recomendado para caché de objetos en alta concurrencia.
 
 ---
 
 ## 🔌 Integración con Evolution API
 
-Kurukin Core actúa como un "Manager" de Evolution API. No requiere configuración manual por usuario. La integración se define globalmente y el plugin gestiona las instancias individuales.
+La integración se define globalmente en el `wp-config.php` (o `docker-compose.yml`) y el plugin gestiona las instancias individuales mediante el `Evolution_Service`.
 
-### Configuración en `wp-config.php`
-
-Define estas constantes en tu archivo de configuración para conectar el núcleo:
+### Constantes Requeridas
 
 ```php
-// 1. Seguridad Interna (Encriptación de Keys en BD)
-define('KURUKIN_ENCRYPTION_KEY', 'tu_string_aleatorio_32_caracteres_minimo');
-define('KURUKIN_API_SECRET', 'token_seguro_para_validar_peticiones_de_n8n');
+// 1. Seguridad Interna
+define('KURUKIN_ENCRYPTION_KEY', 'tu_clave_segura_32_chars');
+define('KURUKIN_API_SECRET', 'token_validacion_n8n');
 
-// 2. Conexión a Evolution API (Infraestructura)
-define('KURUKIN_EVOLUTION_URL', 'https://api.whatsapp.tuservidor.com'); // Sin slash al final
-define('KURUKIN_EVOLUTION_GLOBAL_KEY', 'tu_global_api_key_de_evolution');
-
-```
-
-### Lógica de Mapeo
-
-El sistema mapea automáticamente:
-
-* **Usuario WP:** `javierquiroz`
-* **Instancia Evolution:** `javierquiroz` (El `post_name` o `user_login` se usa como ID de instancia).
-
----
-
-## 📡 Documentación de API (Endpoints & Payloads)
-
-El plugin expone endpoints REST para el Frontend (React) y para el Backend de IA (n8n).
-
-### A. Endpoints Frontend (React App)
-
-Autenticación vía **WordPress Nonce** (`X-WP-Nonce`).
-
-#### 1. Obtener Estado de Conexión
-
-`GET /wp-json/kurukin/v1/connection/status`
-
-**Respuesta JSON:**
-
-```json
-{
-  "state": "open", // open | close | connecting
-  "instance": "javierquiroz",
-  "phone": "59177777777", // Si está conectado
-  "platform": "whatsapp"
-}
-
-```
-
-#### 2. Guardar Configuración (Cerebro/Voz)
-
-`POST /wp-json/kurukin/v1/settings`
-
-**Payload Esperado (Body):**
-
-```json
-{
-  "brain": {
-    "system_prompt": "Eres un asistente experto en ventas...",
-    "openai_api_key": "sk-proj-..."
-  },
-  "voice": {
-    "enabled": true,
-    "eleven_api_key": "xi-...",
-    "voice_id": "JBFqnCBsd6RMkjVDRZzb"
-  },
-  "business": {
-    "profile": "Empresa de Logística...",
-    "services": "Rastreo GPS, Envíos...",
-    "rules": "No dar precios sin cotización..."
-  }
-}
-
-```
-
----
-
-### B. Endpoints Backend (Para n8n)
-
-Autenticación vía Header: `x-kurukin-secret`.
-
-#### 1. Obtener Contexto Completo
-
-`GET /wp-json/kurukin/v1/context?user_id=javierquiroz`
-
-Este endpoint es consumido por n8n antes de procesar un mensaje. Devuelve todo lo necesario para armar el prompt.
-
-**Respuesta JSON:**
-
-```json
-{
-  "status": "success",
-  "router_logic": {
-    "plan_status": "active",
-    "business_vertical": "logistics",
-    "cluster_node": "alpha-01"
-  },
-  "ai_brain": {
-    "provider": "openai",
-    "api_key_decrypted": "sk-proj-...", // Desencriptada al vuelo
-    "model": "gpt-4o",
-    "system_prompt": "Eres un asistente..."
-  },
-  "voice_config": {
-    "provider": "elevenlabs",
-    "enabled": true,
-    "api_key_decrypted": "xi-...",
-    "voice_id": "JBFqnCBsd6RMkjVDRZzb"
-  },
-  "business_data": {
-    "formatted_context": "PERFIL:\nEmpresa de Logística...\n\nSERVICIOS:\nRastreo GPS..."
-  }
-}
+// 2. Conexión a Infraestructura (Red Interna Docker recomendada)
+define('KURUKIN_EVOLUTION_URL', 'http://evolution_evolution_api:8080');
+define('KURUKIN_EVOLUTION_GLOBAL_KEY', 'tu_global_api_key');
 
 ```
 
@@ -175,32 +73,58 @@ Este endpoint es consumido por n8n antes de procesar un mensaje. Devuelve todo l
 
 ## 🚀 Características Principales
 
-### 🔌 Conectividad & Frontend
+### 🔌 Conectividad & Frontend (React v2.6)
 
-* **Dashboard React:** Interfaz moderna ("Dark Mode" nativo) que utiliza Design Tokens para consistencia visual.
-* **Smart QR:** Detección de estados, auto-creación de instancias y regeneración de QR en caso de timeout.
-* **Cache Busting:** Sistema inteligente (`filemtime`) que fuerza la recarga de scripts JS en el navegador del cliente cuando se actualiza el plugin.
+* **Mobile-First Dashboard:** Interfaz responsiva que elimina problemas de scroll y visualización en dispositivos móviles.
+* **Smart QR:** Detección de estados, auto-creación de instancias y regeneración automática.
+* **Cache Busting:** Sistema inteligente (`filemtime`) que fuerza la recarga de scripts JS automáticamente al actualizar el plugin.
 
-### 🛡️ Seguridad & Estabilidad
+### 🛡️ Backend & Estabilidad (Core v2.6)
 
-* **Fail Fast Validation:** El frontend valida las API Keys de OpenAI y ElevenLabs contra sus servidores reales antes de permitir guardar.
-* **Encriptación AES-256:** Las llaves sensibles nunca se guardan en texto plano en la base de datos `wp_postmeta`.
-* **Manejo de Errores:** Controladores blindados para evitar que una falla en Evolution tumbe el sitio WordPress.
+* **Service Layer Pattern:** Lógica de negocio separada de los controladores REST (`Evolution_Service`).
+* **Secure Logging:** Sistema de logs interno (`Kurukin_Logger`) con rotación diaria y protección `.htaccess` automática.
+* **Fail Fast Validation:** Validación de credenciales externas (OpenAI/ElevenLabs) antes de guardar.
+* **Encriptación AES-256:** Protección de API Keys en base de datos.
 
 ---
 
-## 📲 Instalación y Uso
+## 🛠️ Estructura del Proyecto
 
-1. Subir la carpeta `kurukin-core` a `/wp-content/plugins/`.
-2. Activar el plugin en WordPress.
-3. Configurar las constantes en `wp-config.php`.
-4. Crear una página en WordPress y añadir el shortcode:
 ```text
-[kurukin_connect]
+kurukin-core/
+├── kurukin-core.php                 # Loader & Constantes Globales
+├── assets/
+│   └── js/
+│       └── connection-app.js        # React App (QR Logic)
+├── includes/
+│   ├── api/                         # REST API Controllers
+│   │   ├── class-kurukin-connection-controller.php
+│   │   └── ...
+│   ├── services/                    # Business Logic & Utilities (NUEVO)
+│   │   ├── class-evolution-service.php  # Abstracción API WhatsApp
+│   │   └── class-kurukin-logger.php     # Auditoría Segura
+│   ├── integrations/
+│   │   └── class-kurukin-memberpress.php
+│   └── class-kurukin-fields.php     # Admin Helpers
 
 ```
 
+---
 
+## 📜 Historial de Versiones (Changelog)
+
+### [2.6.0] - 2026-02-01 (Stable Release)
+
+* **Refactor:** Implementación de Arquitectura de Servicios (`Evolution_Service`).
+* **Feat:** Sistema de Logging Interno Seguro (`Kurukin_Logger`).
+* **UX/Fix:** Solución definitiva al scroll en móviles y layout responsivo en React.
+* **DevOps:** Inyección de configuración de Evolution API vía variables de entorno Docker.
+* **Core:** Implementación de Cache Busting automático para assets JS.
+
+### [1.8.0] - 2026-01-30
+
+* **Feat:** Dashboard Frontend inicial en React.
+* **Feat:** Lógica "Smart QR" básica.
 
 ---
 
