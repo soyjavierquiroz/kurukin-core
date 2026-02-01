@@ -22,6 +22,11 @@ if ( ! defined( 'KURUKIN_NONCE_ACTION' ) ) {
 
 // --- 2. CARGA DE MÓDULOS ---
 $files = [
+    // Servicios Base (NUEVO: Logger y Evolution Service)
+    'includes/services/class-kurukin-logger.php',
+    'includes/services/class-evolution-service.php',
+    
+    // Lógica existente
     'includes/class-kurukin-fields.php',
     'includes/services/class-kurukin-bridge.php',
     'includes/integrations/class-kurukin-memberpress.php'
@@ -62,9 +67,6 @@ class Plugin {
 
     public function register_assets() {
         // --- CACHE BUSTING AUTOMÁTICO ---
-        // En lugar de usar la versión '2.1.0' fija, usamos la fecha de modificación del archivo.
-        // Esto obliga al navegador a descargar el JS nuevo si detecta que el archivo cambió.
-        
         $js_url  = KURUKIN_CORE_URL . 'assets/js/connection-app.js';
         $js_path = KURUKIN_CORE_PATH . 'assets/js/connection-app.js';
         
