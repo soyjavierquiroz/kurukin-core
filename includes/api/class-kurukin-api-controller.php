@@ -13,7 +13,9 @@ class Controller extends WP_REST_Controller {
     protected $namespace = 'kurukin/v1';
     protected $resource  = 'config';
 
-    public function __construct() { $this->register_routes(); }
+    public function __construct() {
+        $this->register_routes();
+    }
 
     public function register_routes() {
         register_rest_route( $this->namespace, '/' . $this->resource, [
@@ -22,10 +24,13 @@ class Controller extends WP_REST_Controller {
                 'callback' => [ $this, 'get_config' ],
                 'permission_callback' => [ $this, 'check_permission' ],
                 'args' => [
-                    'instance_id' => [ 'required' => true ],
+                    'instance_id' => [
+                        'required' => true,
+                        'type'     => 'string',
+                    ],
                 ],
-            ]
-        ]);
+            ],
+        ] );
     }
 
     public function check_permission( WP_REST_Request $request ) {
@@ -42,7 +47,10 @@ class Controller extends WP_REST_Controller {
     }
 
     public function get_config( WP_REST_Request $request ) {
-        $instance_id = sanitize_text_field( (string) $request->get_param( 'instance_id' ) );
+        // 0) instance_id (hardening: only allow a-z0-9_-)
+        $instance_id = strtolower( trim( (string) $request->get_param( 'instance_id' ) ) );
+        $instance_id = preg_replace( '/[^a-z0-9_\-]/', '', $instance_id );
+
         if ( $instance_id === '' ) {
             return new WP_Error( '400', 'instance_id required', [ 'status' => 400 ] );
         }
@@ -50,10 +58,12 @@ class Controller extends WP_REST_Controller {
         // 1) Encontrar el tenant (saas_instance) dueño de ese instance_id
         $query = new WP_Query([
             'post_type'      => 'saas_instance',
+            'post_status'    => 'publish',
             'meta_key'       => '_kurukin_evolution_instance_id',
             'meta_value'     => $instance_id,
             'posts_per_page' => 1,
             'fields'         => 'ids',
+            'no_found_rows'  => true,
         ]);
 
         if ( empty( $query->posts ) ) {
@@ -73,19 +83,22 @@ class Controller extends WP_REST_Controller {
 
         // 3) Recuperar datos tenant
         $prefix   = '_kurukin_';
-        $vertical = get_post_meta( $post_id, $prefix . 'business_vertical', true ) ?: 'general';
-        $node     = get_post_meta( $post_id, $prefix . 'cluster_node', true ) ?: 'alpha-01';
-        $prompt   = get_post_meta( $post_id, $prefix . 'system_prompt', true );
+        $vertical = (string) get_post_meta( $post_id, $prefix . 'business_vertical', true );
+        $node     = (string) get_post_meta( $post_id, $prefix . 'cluster_node', true );
+        $prompt   = (string) get_post_meta( $post_id, $prefix . 'system_prompt', true );
+
+        $vertical = $vertical !== '' ? sanitize_title( $vertical ) : 'general';
+        $node     = $node !== '' ? sanitize_text_field( $node ) : 'alpha-01';
 
         // Voz
         $voice_enabled = get_post_meta( $post_id, $prefix . 'voice_enabled', true );
-        $voice_id      = get_post_meta( $post_id, $prefix . 'eleven_voice_id', true );
-        $voice_model   = get_post_meta( $post_id, $prefix . 'eleven_model_id', true );
+        $voice_id      = (string) get_post_meta( $post_id, $prefix . 'eleven_voice_id', true );
+        $voice_model   = (string) get_post_meta( $post_id, $prefix . 'eleven_model_id', true );
 
         // Contexto
-        $ctx_profile  = get_post_meta( $post_id, $prefix . 'context_profile', true );
-        $ctx_services = get_post_meta( $post_id, $prefix . 'context_services', true );
-        $ctx_rules    = get_post_meta( $post_id, $prefix . 'context_rules', true );
+        $ctx_profile  = (string) get_post_meta( $post_id, $prefix . 'context_profile', true );
+        $ctx_services = (string) get_post_meta( $post_id, $prefix . 'context_services', true );
+        $ctx_rules    = (string) get_post_meta( $post_id, $prefix . 'context_rules', true );
 
         // Keys (de negocio)
         $openai_key = $this->decrypt( get_post_meta( $post_id, $prefix . 'openai_api_key', true ) );
@@ -106,14 +119,14 @@ class Controller extends WP_REST_Controller {
 
         // 5) Build Business Data
         $business_data = [];
-        if ( $ctx_profile )  { $business_data[] = [ 'category' => 'COMPANY_PROFILE', 'content' => $ctx_profile ]; }
-        if ( $ctx_services ) { $business_data[] = [ 'category' => 'SERVICES_LIST',   'content' => $ctx_services ]; }
-        if ( $ctx_rules )    { $business_data[] = [ 'category' => 'RULES',           'content' => $ctx_rules ]; }
+        if ( $ctx_profile !== '' )  { $business_data[] = [ 'category' => 'COMPANY_PROFILE', 'content' => $ctx_profile ]; }
+        if ( $ctx_services !== '' ) { $business_data[] = [ 'category' => 'SERVICES_LIST',   'content' => $ctx_services ]; }
+        if ( $ctx_rules !== '' )    { $business_data[] = [ 'category' => 'RULES',           'content' => $ctx_rules ]; }
 
         // 6) ✅ Respuesta final: incluye evolution_connection
-        return rest_ensure_response([
-            'status'      => 'success',
-            'instance_id'  => $instance_id,
+        $payload = [
+            'status'     => 'success',
+            'instance_id' => $instance_id,
 
             'router_logic' => [
                 'workflow_mode' => $vertical,
@@ -143,19 +156,30 @@ class Controller extends WP_REST_Controller {
                 'endpoint' => $evo_endpoint,
                 'apikey'   => $evo_apikey,
             ],
-        ]);
+        ];
+
+        $resp = rest_ensure_response( $payload );
+
+        // (Opcional PRO) evita caching si te preocupa que proxies cacheen apikey
+        // $resp->header( 'Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0' );
+
+        return $resp;
     }
 
-    private function decrypt( $data ) {
+    private function decrypt( $data ): string {
         if ( empty( $data ) ) return '';
 
-        $key = defined( 'KURUKIN_ENCRYPTION_KEY' ) ? KURUKIN_ENCRYPTION_KEY : wp_salt( 'auth' );
+        $key = defined( 'KURUKIN_ENCRYPTION_KEY' ) ? (string) KURUKIN_ENCRYPTION_KEY : (string) wp_salt( 'auth' );
+
         $decoded = base64_decode( (string) $data, true );
         if ( $decoded === false ) return '';
 
         $parts = explode( '::', $decoded, 2 );
         if ( count( $parts ) < 2 ) return '';
 
-        return (string) openssl_decrypt( $parts[0], 'AES-256-CBC', $key, 0, $parts[1] );
+        $plain = openssl_decrypt( $parts[0], 'AES-256-CBC', $key, 0, $parts[1] );
+        if ( $plain === false ) return '';
+
+        return (string) $plain;
     }
 }
