@@ -1,97 +1,124 @@
 <?php
 namespace Kurukin\Core\API;
-use WP_REST_Controller; use WP_Error; use Throwable;
+
+use WP_REST_Controller;
+use WP_Error;
+use Throwable;
 
 if ( ! defined( 'ABSPATH' ) ) { exit; }
 
+// Cargamos la clase con FQN en runtime (evita fatal si no está cargada por include)
+use Kurukin\Core\Services\Evolution_Service;
+
 class Connection_Controller extends WP_REST_Controller {
+
     protected $namespace = 'kurukin/v1';
     protected $resource  = 'connection';
 
-    public function __construct() { $this->register_routes(); }
+    private ?Evolution_Service $evolution = null;
+
+    public function __construct() {
+        // Evita fatal: solo instanciamos si la clase existe
+        if ( class_exists( Evolution_Service::class ) ) {
+            $this->evolution = new Evolution_Service();
+        }
+        $this->register_routes();
+    }
 
     public function register_routes() {
-        register_rest_route( $this->namespace, '/' . $this->resource . '/status', [ 'methods' => 'GET', 'callback' => [ $this, 'get_status' ], 'permission_callback' => '__return_true' ]);
-        register_rest_route( $this->namespace, '/' . $this->resource . '/qr', [ 'methods' => 'GET', 'callback' => [ $this, 'get_qr_smart' ], 'permission_callback' => '__return_true' ]);
-        register_rest_route( $this->namespace, '/' . $this->resource . '/reset', [ 'methods' => 'POST', 'callback' => [ $this, 'reset_instance' ], 'permission_callback' => '__return_true' ]);
+        register_rest_route( $this->namespace, '/' . $this->resource . '/status', [
+            'methods'  => 'GET',
+            'callback' => [ $this, 'get_status' ],
+            'permission_callback' => [ $this, 'permissions_check' ],
+        ]);
+
+        register_rest_route( $this->namespace, '/' . $this->resource . '/qr', [
+            'methods'  => 'GET',
+            'callback' => [ $this, 'get_qr_smart' ],
+            'permission_callback' => [ $this, 'permissions_check' ],
+        ]);
+
+        register_rest_route( $this->namespace, '/' . $this->resource . '/reset', [
+            'methods'  => 'POST',
+            'callback' => [ $this, 'reset_instance' ],
+            'permission_callback' => [ $this, 'permissions_check' ],
+        ]);
+    }
+
+    public function permissions_check() {
+        if ( is_user_logged_in() ) return true;
+        return new WP_Error( 'kurukin_unauthorized', 'Login required', [ 'status' => 401 ] );
     }
 
     public function get_status() {
         try {
-            if ( ! is_user_logged_in() ) return new WP_Error( '401', 'Login', ['status'=>401] );
-            $c = $this->cfg();
-            $res = $this->req('GET', "instance/connectionState/{$c['i']}", null, $c);
-            
-            // Si hay error de red o no existe la instancia
-            if(is_wp_error($res)) return ['state'=>'network_error','message'=>$res->get_error_message()];
-            if(!isset($res['instance'])) return ['state'=>'close'];
-            
-            return ['state'=>$res['instance']['state']];
-        } catch(Throwable $e) { return ['state'=>'error','message'=>$e->getMessage()]; }
+            $this->assert_service_ready();
+
+            $user_id = get_current_user_id();
+            if ( $user_id <= 0 ) {
+                return new WP_Error( 'kurukin_unauthorized', 'Login required', [ 'status' => 401 ] );
+            }
+
+            // Se espera que Evolution_Service devuelva array o WP_Error
+            $res = $this->evolution->get_connection_state( $user_id );
+
+            // Si viene WP_Error, lo devolvemos tal cual (REST lo serializa)
+            if ( is_wp_error( $res ) ) return $res;
+
+            // Respuesta estable
+            return is_array( $res ) ? $res : [ 'state' => 'unknown' ];
+
+        } catch ( Throwable $e ) {
+            return new WP_Error( 'kurukin_internal_error', $e->getMessage(), [ 'status' => 500 ] );
+        }
     }
 
     public function get_qr_smart() {
         try {
-            if ( ! is_user_logged_in() ) return new WP_Error( '401', 'Login', ['status'=>401] );
-            $c = $this->cfg();
-            
-            // 1. Intentar pedir QR
-            $res = $this->req('GET', "instance/connect/{$c['i']}", null, $c);
-            
-            // 2. Si no existe (404), CREAR
-            if(isset($res['status']) && $res['status'] == 404) {
-                $this->req('POST', 'instance/create', [
-                    'instanceName' => $c['i'], 
-                    'integration' => 'WHATSAPP-BAILEYS', 
-                    'qrcode' => true
-                ], $c);
-                
-                // Esperar 1 segundo para inicialización
-                sleep(1);
+            $this->assert_service_ready();
+
+            $user_id = get_current_user_id();
+            if ( $user_id <= 0 ) {
+                return new WP_Error( 'kurukin_unauthorized', 'Login required', [ 'status' => 401 ] );
             }
 
-            // 3. BUCLE DE REINTENTO (La clave del éxito)
-            // Intentamos 5 veces obtener el QR (esperando 1s entre intentos)
-            // Porque Evolution tarda en generar la imagen base64
-            for ($k = 0; $k < 5; $k++) {
-                $res = $this->req('GET', "instance/connect/{$c['i']}", null, $c);
-                
-                // Si tenemos QR, rompemos el bucle y lo devolvemos
-                if ( isset($res['base64']) && !empty($res['base64']) ) {
-                    return ['base64' => $res['base64'], 'code' => isset($res['code'])?$res['code']:null];
-                }
-                
-                // Si no, esperamos 1 segundo y reintentamos
-                sleep(1);
-            }
+            $res = $this->evolution->connect_and_get_qr( $user_id );
+            if ( is_wp_error( $res ) ) return $res;
 
-            // Si llegamos aquí, Evolution no generó el QR a tiempo
-            return ['base64' => null, 'message' => 'Timeout esperando QR'];
+            // Respuesta estable: base64, code
+            return is_array( $res ) ? $res : [ 'base64' => null, 'message' => 'Unexpected response' ];
 
-        } catch(Throwable $e) { return new WP_Error('500',$e->getMessage(),['status'=>500]); }
+        } catch ( Throwable $e ) {
+            return new WP_Error( 'kurukin_internal_error', $e->getMessage(), [ 'status' => 500 ] );
+        }
     }
 
     public function reset_instance() {
-        $c = $this->cfg();
-        $this->req('DELETE', "instance/delete/{$c['i']}", null, $c);
-        return $this->get_qr_smart();
+        try {
+            $this->assert_service_ready();
+
+            $user_id = get_current_user_id();
+            if ( $user_id <= 0 ) {
+                return new WP_Error( 'kurukin_unauthorized', 'Login required', [ 'status' => 401 ] );
+            }
+
+            $res = $this->evolution->reset_instance( $user_id );
+            if ( is_wp_error( $res ) ) return $res;
+
+            return is_array( $res ) ? $res : [ 'ok' => true ];
+
+        } catch ( Throwable $e ) {
+            return new WP_Error( 'kurukin_internal_error', $e->getMessage(), [ 'status' => 500 ] );
+        }
     }
 
-    private function cfg() {
-        $u = wp_get_current_user();
-        return [
-            'i' => sanitize_title($u->user_login),
-            'u' => 'http://evolution_api_v2:8080',
-            'k' => 'cdfedf0ae18a2b08cdd180823fad884d'
-        ];
-    }
+    // ---------------------------------------------------------------------
+    // Guardrails
+    // ---------------------------------------------------------------------
 
-    private function req($m, $ep, $b, $c) {
-        $url = trailingslashit($c['u']) . $ep;
-        $args = ['method'=>$m, 'headers'=>['Content-Type'=>'application/json','apikey'=>$c['k']], 'timeout'=>15, 'sslverify'=>false];
-        if($b) $args['body'] = json_encode($b);
-        $res = wp_remote_request($url, $args);
-        if(is_wp_error($res)) return $res;
-        return json_decode(wp_remote_retrieve_body($res), true) ?: [];
+    private function assert_service_ready(): void {
+        if ( ! $this->evolution instanceof Evolution_Service ) {
+            throw new \RuntimeException( 'Evolution_Service not available (autoload/include failed).' );
+        }
     }
 }
