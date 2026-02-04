@@ -12,17 +12,18 @@ if ( ! defined( 'ABSPATH' ) ) { exit; }
  *   'stack_id' => 'evo-alpha-01',
  *   'evolution_endpoint' => 'http://evolution_api_v2:8080',
  *   'evolution_apikey' => 'xxxx',
- *   'n8n_webhook_base' => 'http://n8n2:5678',
+ *   'n8n_webhook_base' => 'http://n8n-v2_n8n_v2_webhook:5678',
+ *   'n8n_router_id' => 'e699da51-....', // REQUIRED when using dynamic routes in n8n
  *   'active' => true,
  *   'capacity' => 1000,
- *   'supported_verticals' => ['dentistas','general'],
- *   'webhook_event_type' => 'MESSAGES_UPSERT' // or legacy 'messages.upsert'
+ *   'supported_verticals' => ['multinivel','general'],
+ *   'webhook_event_type' => 'MESSAGES_UPSERT'
  * ]
  */
 class Infrastructure_Registry {
 
     const OPTION_STACKS = 'kurukin_infra_stacks';
-    const OPTION_RR_PTR = 'kurukin_infra_rr_pointer'; // per-vertical pointer map
+    const OPTION_RR_PTR = 'kurukin_infra_rr_pointer';
 
     /**
      * Default webhook event if stack doesn't specify.
@@ -39,12 +40,10 @@ class Infrastructure_Registry {
     public static function get_stacks(): array {
         $raw = get_option( self::OPTION_STACKS, [] );
 
-        // If already array
         if ( is_array( $raw ) ) {
             return self::normalize_stacks( $raw );
         }
 
-        // If string: try JSON then unserialize
         if ( is_string( $raw ) ) {
             $trim = trim( $raw );
 
@@ -52,13 +51,11 @@ class Infrastructure_Registry {
             if ( $trim !== '' && ( $trim[0] === '[' || $trim[0] === '{' || $trim[0] === '"' ) ) {
                 $decoded = json_decode( $trim, true );
 
-                // Sometimes wp-cli stores JSON array as JSON-string inside JSON output,
-                // but get_option returns the raw string like: "[{...}]"
                 if ( is_array( $decoded ) ) {
                     return self::normalize_stacks( $decoded );
                 }
 
-                // If it was a JSON-encoded string (quoted), decode twice
+                // decode twice if quoted json-string
                 if ( is_string( $decoded ) ) {
                     $decoded2 = json_decode( $decoded, true );
                     if ( is_array( $decoded2 ) ) {
@@ -98,7 +95,6 @@ class Infrastructure_Registry {
             }
         }
 
-        // Always include a safe fallback
         $verticals['general'] = true;
 
         $out = array_keys( $verticals );
@@ -133,7 +129,6 @@ class Infrastructure_Registry {
         }
 
         if ( empty( $candidates ) ) {
-            // last resort: any active stack
             $candidates = $active;
         }
 
@@ -184,12 +179,12 @@ class Infrastructure_Registry {
     /**
      * Validates and normalizes one stack record.
      * Ensures webhook_event_type exists and is a non-empty string.
+     * Ensures n8n_router_id exists (empty allowed but should be set in infra).
      */
     private static function normalize_stack( array $s ): array {
         $stack_id = isset( $s['stack_id'] ) ? sanitize_text_field( (string) $s['stack_id'] ) : '';
         $active   = ! empty( $s['active'] );
 
-        // endpoints/keys
         $evo_endpoint = isset( $s['evolution_endpoint'] ) ? (string) $s['evolution_endpoint'] : '';
         $evo_apikey   = isset( $s['evolution_apikey'] ) ? sanitize_text_field( (string) $s['evolution_apikey'] ) : '';
         $n8n_base     = isset( $s['n8n_webhook_base'] ) ? (string) $s['n8n_webhook_base'] : '';
@@ -205,11 +200,10 @@ class Infrastructure_Registry {
         if ( empty( $supported ) ) {
             $supported = [ 'general' ];
         } elseif ( ! in_array( 'general', $supported, true ) ) {
-            // always allow general fallback
             $supported[] = 'general';
         }
 
-        // webhook_event_type (explicit per stack)
+        // webhook_event_type
         $event = '';
         if ( isset( $s['webhook_event_type'] ) ) {
             $event = trim( (string) $s['webhook_event_type'] );
@@ -217,13 +211,18 @@ class Infrastructure_Registry {
         if ( $event === '' ) {
             $event = self::DEFAULT_WEBHOOK_EVENT_TYPE;
         }
-
-        // small sanitization: keep dots/underscores/hyphens and letters/numbers
-        // (allows both "MESSAGES_UPSERT" and "messages.upsert")
         $event = preg_replace( '/[^A-Za-z0-9_\.\-]/', '', $event );
         if ( $event === '' ) {
             $event = self::DEFAULT_WEBHOOK_EVENT_TYPE;
         }
+
+        // n8n_router_id (required for dynamic routes; keep empty if not configured)
+        $router_id = '';
+        if ( isset( $s['n8n_router_id'] ) ) {
+            $router_id = trim( (string) $s['n8n_router_id'] );
+        }
+        // Allow UUID only chars + hyphen (fail to empty if junk)
+        $router_id = preg_replace( '/[^a-fA-F0-9\-]/', '', $router_id );
 
         $norm = [
             'stack_id'            => $stack_id,
@@ -233,9 +232,9 @@ class Infrastructure_Registry {
             'n8n_webhook_base'    => $n8n_base,
             'supported_verticals' => $supported,
             'webhook_event_type'  => $event,
+            'n8n_router_id'       => $router_id,
         ];
 
-        // pass-through optional fields safely
         if ( isset( $s['capacity'] ) ) {
             $norm['capacity'] = (int) $s['capacity'];
         }

@@ -68,47 +68,51 @@ class Tenant_Service {
     }
 
     /**
-     * Assign endpoint/apikey/webhook/webhook_event_type based on registry stacks + vertical.
+     * Assign endpoint/apikey/n8n_base/router_id/webhook_event_type based on registry stacks + vertical.
      *
      * Pinning rule:
-     * - If endpoint/apikey/webhook already exist -> keep them (tenant pinned)
-     * - BUT: if webhook_event_type missing, we still set it (safe, does not reroute infra)
+     * - If endpoint/apikey/n8n_base already exist -> keep them (tenant pinned)
+     * - BUT: if webhook_event_type missing, we still set it
+     * - BUT: if n8n_router_id missing, we still set it
      */
     public static function ensure_routing_meta( int $post_id, int $user_id ): void {
-        $endpoint = (string) get_post_meta( $post_id, '_kurukin_evolution_endpoint', true );
-        $apikey   = (string) get_post_meta( $post_id, '_kurukin_evolution_apikey', true );
-        $webhook  = (string) get_post_meta( $post_id, '_kurukin_n8n_webhook_url', true );
-        $event    = (string) get_post_meta( $post_id, '_kurukin_evolution_webhook_event', true );
+        $endpoint   = (string) get_post_meta( $post_id, '_kurukin_evolution_endpoint', true );
+        $apikey     = (string) get_post_meta( $post_id, '_kurukin_evolution_apikey', true );
 
-        $has_routing = ( $endpoint !== '' && $apikey !== '' && $webhook !== '' );
+        // IMPORTANT: this meta now stores ONLY the n8n base (NO /webhook/... suffix)
+        $n8n_base   = (string) get_post_meta( $post_id, '_kurukin_n8n_webhook_url', true );
+
+        $event      = (string) get_post_meta( $post_id, '_kurukin_evolution_webhook_event', true );
+        $router_id  = (string) get_post_meta( $post_id, '_kurukin_n8n_router_id', true );
+
+        $has_routing = ( $endpoint !== '' && $apikey !== '' && $n8n_base !== '' );
 
         // Vertical always from tenant
         $vertical = (string) get_post_meta( $post_id, '_kurukin_business_vertical', true );
         $vertical = $vertical ? sanitize_title( $vertical ) : 'general';
 
-        // Pick stack (even if pinned, we may need it for event default when event missing)
+        // Pick stack
         $stack = Infrastructure_Registry::pick_stack_for_vertical( $vertical );
 
         // Defaults (global constants)
         $default_evo_url = defined( 'KURUKIN_EVOLUTION_URL' ) ? (string) KURUKIN_EVOLUTION_URL : '';
         $default_evo_key = defined( 'KURUKIN_EVOLUTION_GLOBAL_KEY' ) ? (string) KURUKIN_EVOLUTION_GLOBAL_KEY : '';
 
-        // 1) If not pinned, assign endpoint/apikey/webhook and stack_id
+        // 1) If not pinned, assign endpoint/apikey/n8n_base and stack_id
         if ( ! $has_routing ) {
             $endpoint = $endpoint !== '' ? $endpoint : ( (string) ( $stack['evolution_endpoint'] ?? $default_evo_url ) );
             $apikey   = $apikey   !== '' ? $apikey   : ( (string) ( $stack['evolution_apikey']   ?? $default_evo_key ) );
 
-            if ( $webhook === '' ) {
+            if ( $n8n_base === '' ) {
                 $base = (string) ( $stack['n8n_webhook_base'] ?? ( defined( 'KURUKIN_N8N_WEBHOOK_BASE' ) ? (string) KURUKIN_N8N_WEBHOOK_BASE : '' ) );
                 $base = $base ? untrailingslashit( $base ) : '';
 
-                $computed = $base ? ( $base . '/webhook/' . $vertical ) : '';
+                // Store base only (no /webhook/{vertical})
+                $computed = $base;
 
-                /**
-                 * Allow override (e.g. include instance_id in path).
-                 */
-                $computed = apply_filters( 'kurukin_n8n_webhook_url', $computed, $user_id, $post_id, $stack );
-                $webhook = (string) $computed;
+                // Allow override via filter (advanced)
+                $computed = apply_filters( 'kurukin_n8n_webhook_base', $computed, $user_id, $post_id, $stack );
+                $n8n_base = (string) $computed;
             }
 
             if ( ! empty( $stack['stack_id'] ) ) {
@@ -117,10 +121,21 @@ class Tenant_Service {
 
             if ( $endpoint !== '' ) update_post_meta( $post_id, '_kurukin_evolution_endpoint', esc_url_raw( $endpoint ) );
             if ( $apikey   !== '' ) update_post_meta( $post_id, '_kurukin_evolution_apikey', sanitize_text_field( $apikey ) );
-            if ( $webhook  !== '' ) update_post_meta( $post_id, '_kurukin_n8n_webhook_url', esc_url_raw( $webhook ) );
+            if ( $n8n_base !== '' ) update_post_meta( $post_id, '_kurukin_n8n_webhook_url', esc_url_raw( $n8n_base ) );
         }
 
-        // 2) Always ensure webhook_event_type exists (safe to set even for pinned tenants)
+        // 2) Always ensure router_id exists (safe)
+        if ( $router_id === '' ) {
+            $router_id = (string) ( $stack['n8n_router_id'] ?? '' );
+            $router_id = trim( $router_id );
+            // UUID-ish sanitization
+            $router_id = preg_replace( '/[^a-fA-F0-9\-]/', '', $router_id );
+            if ( $router_id !== '' ) {
+                update_post_meta( $post_id, '_kurukin_n8n_router_id', sanitize_text_field( $router_id ) );
+            }
+        }
+
+        // 3) Always ensure webhook_event_type exists (safe)
         if ( $event === '' ) {
             $event = (string) ( $stack['webhook_event_type'] ?? Infrastructure_Registry::DEFAULT_WEBHOOK_EVENT_TYPE );
             $event = trim( $event );
@@ -143,7 +158,11 @@ class Tenant_Service {
         $instance_id = (string) get_post_meta( $post_id, '_kurukin_evolution_instance_id', true );
         $endpoint    = (string) get_post_meta( $post_id, '_kurukin_evolution_endpoint', true );
         $apikey      = (string) get_post_meta( $post_id, '_kurukin_evolution_apikey', true );
-        $webhook     = (string) get_post_meta( $post_id, '_kurukin_n8n_webhook_url', true );
+
+        // base only
+        $n8n_base    = (string) get_post_meta( $post_id, '_kurukin_n8n_webhook_url', true );
+        $router_id   = (string) get_post_meta( $post_id, '_kurukin_n8n_router_id', true );
+
         $vertical    = (string) get_post_meta( $post_id, '_kurukin_business_vertical', true );
         $event       = (string) get_post_meta( $post_id, '_kurukin_evolution_webhook_event', true );
 
@@ -152,18 +171,20 @@ class Tenant_Service {
 
         $event = trim( $event );
         if ( $event === '' ) {
-            // should exist due to ensure_routing_meta, but keep safe fallback
             $event = Infrastructure_Registry::DEFAULT_WEBHOOK_EVENT_TYPE;
         }
+
+        $router_id = trim( $router_id );
 
         return [
             'post_id'            => (int) $post_id,
             'instance_id'        => $instance_id,
             'endpoint'           => $endpoint,
             'apikey'             => $apikey,
-            'webhook_url'        => $webhook,
+            'webhook_url'        => $n8n_base,      // base only
             'vertical'           => $vertical,
             'webhook_event_type' => $event,
+            'n8n_router_id'      => $router_id,
         ];
     }
 }
