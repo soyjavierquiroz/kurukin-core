@@ -154,10 +154,8 @@ class Evolution_Service {
             return new WP_Error( 'kurukin_missing_webhook', 'Missing n8n webhook base for tenant' );
         }
 
-        // Remove trailing slash
         $base = untrailingslashit( $base );
 
-        // 🔥 Hardening: if base contains "/webhook/", strip it (fixes old tenants)
         $pos = stripos( $base, '/webhook/' );
         if ( $pos !== false ) {
             $base = rtrim( substr( $base, 0, $pos ), '/' );
@@ -185,6 +183,7 @@ class Evolution_Service {
 
         $final_url = $base . '/webhook/' . $router_id . '/' . $vertical . '/' . $instance_id;
 
+        // ✅ Payload blindado: camelCase + snake_case
         $payload = [
             'webhook' => [
                 'enabled'         => true,
@@ -192,6 +191,7 @@ class Evolution_Service {
                 'webhookByEvents' => false,
                 'events'          => [ $event_type ],
                 'webhookBase64'   => true,
+                'webhook_base64'  => true,
             ],
         ];
 

@@ -4,23 +4,24 @@ Plugin “control plane” para Kurukin SaaS sobre WordPress.
 Este plugin desacopla **Usuario (WP User)** de su **Infraestructura (Tenant/Stack)** y orquesta dinámicamente:
 
 - **Evolution API** (WhatsApp Baileys)
-- **n8n** (webhooks por vertical + tenant)
+- **n8n** (webhooks por vertical + tenant, con Router UUID obligatorio)
 - **MemberPress** (control de acceso/pago)
 - **REST API** para que n8n consuma configuración multi-tenant
+- **UI Panel** (Dashboard + Configuración) usando endpoints REST internos
 
 ---
 
 ## 1) Conceptos clave
 
-### Tenant (saas_instance)
+### Tenant (CPT `saas_instance`)
 Cada usuario tiene un CPT `saas_instance` (un “tenant record”) donde se guarda el ruteo y configuración:
 
 - `instance_id` (nombre de la instancia en Evolution)
 - endpoint/apikey por tenant (multi-tenant)
 - vertical de negocio
-- webhook URL hacia n8n
-- evento de Evolution permitido por stack
-- router UUID obligatorio de n8n (para rutas dinámicas)
+- base de webhook hacia n8n (base-only)
+- evento permitido por stack (Evolution enum)
+- Router UUID obligatorio de n8n (para rutas dinámicas)
 
 **Fuente de verdad del ruteo:** `wp_postmeta` del `saas_instance`.
 
@@ -36,11 +37,11 @@ Los stacks de infraestructura viven en `wp_options` como JSON:
 
 ## 2) Flujo de Provisioning (alto nivel)
 
-1. Al login o evento de provisioning, el plugin asegura que exista un `saas_instance` para el usuario.
+1. Al login o provisioning, el plugin asegura que exista un `saas_instance` para el usuario.
 2. Se asigna un stack por vertical (round-robin) y se persisten metadatos críticos.
 3. `Evolution_Service` hace el “birth protocol”:
    - asegura que la instancia existe (check → create si hace falta)
-   - configura webhook en Evolution hacia n8n (payload v2 con wrapper `webhook`)
+   - configura webhook en Evolution hacia n8n (**payload v2** con wrapper `webhook`)
    - pide el QR (base64)
 
 ---
@@ -62,7 +63,7 @@ Ejemplo (Stack Alpha):
     "active": true,
 
     "evolution_endpoint": "http://evolution_api_v2:8080",
-    "evolution_apikey": "YOUR_GLOBAL_OR_STACK_KEY",
+    "evolution_apikey": "YOUR_STACK_KEY",
 
     "n8n_webhook_base": "http://n8n-v2_n8n_v2_webhook:5678",
     "n8n_router_id": "e699da51-5467-4e2c-989e-de0d82fffc23",
@@ -80,7 +81,7 @@ Ejemplo (Stack Alpha):
 * `active` *(bool)*: si el stack puede asignar tenants.
 * `evolution_endpoint` *(string)*: URL interna de Evolution API.
 * `evolution_apikey` *(string)*: apikey para ese Evolution.
-* `n8n_webhook_base` *(string)*: host interno de n8n (sin path o con path legacy; el plugin lo normaliza).
+* `n8n_webhook_base` *(string)*: host interno de n8n (**base**; sin variables).
 * `n8n_router_id` *(string, requerido para wildcards)*: UUID del flujo router en n8n.
 * `webhook_event_type` *(string)*: evento permitido por esa versión de Evolution (ej: `MESSAGES_UPSERT`).
 * `supported_verticals` *(array)*: verticales soportadas por stack (siempre se incluye fallback `general`).
@@ -103,12 +104,15 @@ Routing Evolution (multi-tenant):
 
 Routing n8n:
 
-* `_kurukin_n8n_webhook_url` → (puede venir legacy con `/webhook/<vertical>`, el servicio la limpia al construir URL final)
+* `_kurukin_n8n_webhook_url` → **base only**, ej: `http://n8n-v2...:5678`
 * `_kurukin_n8n_router_id` → `e699da51-...`
 * `_kurukin_evolution_webhook_event` → `MESSAGES_UPSERT`
 
-**Nota:**
-El plugin asegura que `*_webhook_event` exista aunque el tenant esté “pinned” (endpoint/apikey/webhook ya definidos). Esto no cambia ruteo, solo completa la config necesaria para Evolution v2.
+**Notas importantes:**
+
+* El plugin asegura que `*_webhook_event` exista aunque el tenant esté “pinned” (endpoint/apikey/n8n_base ya definidos).
+  Esto no cambia ruteo, solo completa la config necesaria para Evolution v2.
+* Si un tenant legacy trae `_kurukin_n8n_webhook_url` con `/webhook/...`, el builder lo **normaliza** recortando desde `/webhook/` para evitar duplicados.
 
 ---
 
@@ -133,21 +137,23 @@ Ejemplo real:
 http://n8n-v2_n8n_v2_webhook:5678/webhook/e699da51-5467-4e2c-989e-de0d82fffc23/multinivel/javierquiroz
 ```
 
-### Nota sobre “base legacy”
+### Hardening (legacy base)
 
 Si `_kurukin_n8n_webhook_url` trae algo como:
 
 `http://n8n-v2...:5678/webhook/multinivel`
 
-El código normaliza recortando todo lo que esté a partir de `/webhook/` para evitar duplicados.
+El builder recorta desde `/webhook/` para dejarlo como base:
+
+`http://n8n-v2...:5678`
 
 ---
 
-## 6) Evolution Webhook Payload (v2.x)
+## 6) Evolution Webhook Payload (v2.x) — Base64 Blindado
 
-Evolution v2.3.7 requiere wrapper `webhook` y eventos en enum válido.
+Evolution v2.x requiere wrapper `webhook` y eventos en enum válido.
 
-Payload:
+Para evitar regresiones por variaciones de schema (camelCase vs snake_case), el payload envía **AMBOS**:
 
 ```json
 {
@@ -156,7 +162,8 @@ Payload:
     "url": "http://n8n.../webhook/<router_uuid>/<vertical>/<instance_id>",
     "webhookByEvents": false,
     "events": ["MESSAGES_UPSERT"],
-    "webhookBase64": true
+    "webhookBase64": true,
+    "webhook_base64": true
   }
 }
 ```
@@ -191,23 +198,28 @@ Ejemplo (fragmento):
 }
 ```
 
-### 7.2 Connection API (QR y estado)
+### 7.2 UI / Settings API (panel del usuario)
 
-Existe controlador dedicado para:
+La UI del panel consume endpoints internos:
 
-* estado de conexión
-* obtener QR “smart”
-* reset
+* `GET /wp-json/kurukin/v1/settings`
+* `POST /wp-json/kurukin/v1/settings`
+* `POST /wp-json/kurukin/v1/validate-credential`
+* `GET /wp-json/kurukin/v1/connection/status`
+* `GET /wp-json/kurukin/v1/connection/qr`
+* `POST /wp-json/kurukin/v1/connection/reset`
 
-(Ver: `includes/api/class-kurukin-connection-controller.php`)
+**Importante:** estos endpoints requieren `is_user_logged_in()` (sesión WP).
+En CLI pueden devolver 401 si no se simula correctamente el contexto de autenticación.
 
 ---
 
 ## 8) Dependencias / Integraciones
 
 * **MemberPress**: si está activo, se valida que el usuario esté activo antes de entregar `/config`.
-* **Evolution API**: servicio externo (contenedor/stack). Se usa `apikey` por request.
+* **Evolution API**: servicio externo. Se usa `apikey` por request.
 * **n8n**: recibe webhooks con router UUID + variables.
+* **UI (connection-app.js)**: consume `/settings` y `/connection/*`.
 
 ---
 
@@ -243,14 +255,25 @@ command -v wp >/dev/null 2>&1 && wp --info || (
 )'
 ```
 
-### 10.2 Ver tenant actual (user_id=1)
+### 10.2 Setear infra registry (stack) — ejemplo completo
 
 ```bash
 docker exec -it "$WP_CONT" sh -lc \
-'wp --allow-root eval '\''$q=new WP_Query(["post_type"=>"saas_instance","author"=>1,"posts_per_page"=>1,"fields"=>"ids"]); $id=$q->posts[0]??0; echo "TENANT_ID:$id\n";'\'''
+'wp --allow-root option update kurukin_infra_stacks '\''[
+  {
+    "stack_id":"evo-alpha-01",
+    "active":true,
+    "evolution_endpoint":"http://evolution_api_v2:8080",
+    "evolution_apikey":"XXX",
+    "n8n_webhook_base":"http://n8n-v2_n8n_v2_webhook:5678",
+    "n8n_router_id":"e699da51-5467-4e2c-989e-de0d82fffc23",
+    "supported_verticals":["multinivel","general"],
+    "webhook_event_type":"MESSAGES_UPSERT"
+  }
+]'\'''
 ```
 
-### 10.3 Ver metas críticas del tenant
+### 10.3 Ver metas críticas del tenant (ej: post_id=18)
 
 ```bash
 docker exec -it "$WP_CONT" sh -lc \
@@ -263,7 +286,7 @@ echo "ROUTER:".get_post_meta($id,"_kurukin_n8n_router_id",true)."\n";
 echo "N8N_BASE:".get_post_meta($id,"_kurukin_n8n_webhook_url",true)."\n";'\'''
 ```
 
-### 10.4 Probar QR end-to-end (debe devolver base64)
+### 10.4 Probar QR end-to-end (fuerza set_webhook)
 
 ```bash
 docker exec -it "$WP_CONT" sh -lc \
@@ -311,12 +334,12 @@ Causas típicas:
 
 * Falta wrapper `webhook` (Evolution v2 lo exige)
 * Evento inválido (debe ser enum permitido por esa versión)
-* Falta `webhookBase64: true`
+* Falta `webhookBase64` / incompatibilidad camelCase vs snake_case
 
 Solución:
 
 * configurar `webhook_event_type` por stack
-* usar payload v2 (ver sección 6)
+* payload blindado (Sección 6)
 
 ### 11.3 404 en n8n con rutas dinámicas
 
@@ -330,30 +353,46 @@ Solución:
 * agregar `n8n_router_id` al stack
 * construir URL final con router UUID
 
+### 11.4 UI “Configuración” no carga (React se queda pegado)
+
+Causa típica:
+
+* Fatal en backend por dependencia inexistente (`Infrastructure_Registry_Helper`)
+
+Solución:
+
+* `Settings_Controller` debe usar `Tenant_Service` como source of truth (auto-heal tenant + routing)
+* al corregir eso, `/settings` vuelve a responder y la UI deja de crashear
+
 ---
 
-## 12) Changelog (resumen de los últimos cambios)
+## 12) Changelog (resumen de cambios recientes)
 
 * Multi-tenant real: Evolution endpoint/apikey salen del meta del tenant (no de constantes).
+* REST `/config`:
+
+  * agrega `evolution_connection` (endpoint/apikey) dinámico por tenant (fallback legacy)
 * `Evolution_Service`:
 
   * no crea a ciegas: verifica existencia antes de crear
   * payload correcto para `webhook/set` en Evolution v2 (wrapper + base64)
+  * base64 blindado: `webhookBase64` + `webhook_base64`
   * evento permitido configurable por stack (`webhook_event_type`)
-  * URL n8n corregida para router UUID (`n8n_router_id`) + vertical + instance_id
-  * robustez: extracción de error messages sin warnings (arrays anidados)
+  * URL n8n corregida: `/webhook/{router_uuid}/{vertical}/{instance_id}`
+  * hardening: si n8n_base trae `/webhook/...`, se recorta automáticamente
 * `Infrastructure_Registry`:
 
   * soporta stacks guardados como array/JSON/serialized
-  * normaliza y valida `webhook_event_type` (+ defaults)
-  * normaliza verticals (incluye `general`)
+  * normaliza y valida `webhook_event_type` y `n8n_router_id`
+  * normaliza verticales (incluye `general`)
 * `Tenant_Service`:
 
   * persiste `_kurukin_evolution_webhook_event`
-  * persiste `_kurukin_n8n_router_id` (cuando está disponible en stack)
-* REST `/config`:
+  * persiste `_kurukin_n8n_router_id`
+  * `_kurukin_n8n_webhook_url` se trata como **base only**
+* `Settings_Controller`:
 
-  * agrega `evolution_connection` (endpoint/apikey) dinámico por tenant (fallback legacy)
+  * se elimina dependencia de helper inexistente y se usa `Tenant_Service`
 
 ---
 
@@ -371,4 +410,3 @@ Solución:
 * UI Admin para editar `kurukin_infra_stacks` en vez de WP-CLI.
 * Capacidad/quotas por stack + métricas (round-robin ponderado).
 * Cache de config `/config` por tenant (con invalidación por meta update).
-

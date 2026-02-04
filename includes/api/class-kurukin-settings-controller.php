@@ -6,14 +6,9 @@ use WP_REST_Server;
 use WP_Error;
 use WP_Query;
 
-use Kurukin\Core\Services\Infrastructure_Registry_Helper;
+use Kurukin\Core\Services\Tenant_Service;
 
 if ( ! defined( 'ABSPATH' ) ) { exit; }
-
-// Ensure helper is loaded even if core loader doesn't include it yet.
-if ( ! class_exists( '\Kurukin\Core\Services\Infrastructure_Registry_Helper' ) ) {
-	require_once dirname( __DIR__ ) . '/services/class-infrastructure-registry.php';
-}
 
 class Settings_Controller extends WP_REST_Controller {
 
@@ -53,16 +48,16 @@ class Settings_Controller extends WP_REST_Controller {
 		$post_id = $this->ensure_user_instance();
 		if ( is_wp_error( $post_id ) ) return $post_id;
 
-		$prompt        = get_post_meta( $post_id, $this->prefix . 'system_prompt', true );
+		$prompt        = (string) get_post_meta( $post_id, $this->prefix . 'system_prompt', true );
 		$voice_enabled = get_post_meta( $post_id, $this->prefix . 'voice_enabled', true );
-		$voice_id      = get_post_meta( $post_id, $this->prefix . 'eleven_voice_id', true );
+		$voice_id      = (string) get_post_meta( $post_id, $this->prefix . 'eleven_voice_id', true );
 
-		$ctx_profile   = get_post_meta( $post_id, $this->prefix . 'context_profile', true );
-		$ctx_services  = get_post_meta( $post_id, $this->prefix . 'context_services', true );
-		$ctx_rules     = get_post_meta( $post_id, $this->prefix . 'context_rules', true );
+		$ctx_profile   = (string) get_post_meta( $post_id, $this->prefix . 'context_profile', true );
+		$ctx_services  = (string) get_post_meta( $post_id, $this->prefix . 'context_services', true );
+		$ctx_rules     = (string) get_post_meta( $post_id, $this->prefix . 'context_rules', true );
 
-		$vertical      = get_post_meta( $post_id, '_kurukin_business_vertical', true );
-		$vertical      = is_string( $vertical ) ? $vertical : 'general';
+		$vertical      = (string) get_post_meta( $post_id, '_kurukin_business_vertical', true );
+		$vertical      = $vertical !== '' ? sanitize_title( $vertical ) : 'general';
 
 		$openai_key_raw = get_post_meta( $post_id, $this->prefix . 'openai_api_key', true );
 		$eleven_key_raw = get_post_meta( $post_id, $this->prefix . 'eleven_api_key', true );
@@ -91,50 +86,74 @@ class Settings_Controller extends WP_REST_Controller {
 		if ( is_wp_error( $post_id ) ) return $post_id;
 
 		$params = $request->get_json_params();
+		if ( ! is_array( $params ) ) $params = [];
 
 		// Brain
-		if ( isset( $params['brain'] ) ) {
+		if ( isset( $params['brain'] ) && is_array( $params['brain'] ) ) {
 			$brain = $params['brain'];
+
 			if ( isset( $brain['system_prompt'] ) ) {
-				update_post_meta( $post_id, $this->prefix . 'system_prompt', sanitize_textarea_field( $brain['system_prompt'] ) );
+				update_post_meta(
+					$post_id,
+					$this->prefix . 'system_prompt',
+					sanitize_textarea_field( (string) $brain['system_prompt'] )
+				);
 			}
+
 			if ( isset( $brain['openai_api_key'] ) ) {
-				$this->update_secure_key( $post_id, 'openai_api_key', $brain['openai_api_key'] );
+				$this->update_secure_key( $post_id, 'openai_api_key', (string) $brain['openai_api_key'] );
 			}
 		}
 
 		// Voice
-		if ( isset( $params['voice'] ) ) {
+		if ( isset( $params['voice'] ) && is_array( $params['voice'] ) ) {
 			$voice = $params['voice'];
-			if ( isset( $voice['enabled'] ) ) {
-				update_post_meta( $post_id, $this->prefix . 'voice_enabled', $voice['enabled'] ? '1' : '0' );
+
+			if ( array_key_exists( 'enabled', $voice ) ) {
+				update_post_meta( $post_id, $this->prefix . 'voice_enabled', ! empty( $voice['enabled'] ) ? '1' : '0' );
 			}
+
 			if ( isset( $voice['voice_id'] ) ) {
-				update_post_meta( $post_id, $this->prefix . 'eleven_voice_id', sanitize_text_field( $voice['voice_id'] ) );
+				update_post_meta( $post_id, $this->prefix . 'eleven_voice_id', sanitize_text_field( (string) $voice['voice_id'] ) );
 			}
+
 			if ( isset( $voice['eleven_api_key'] ) ) {
-				$this->update_secure_key( $post_id, 'eleven_api_key', $voice['eleven_api_key'] );
+				$this->update_secure_key( $post_id, 'eleven_api_key', (string) $voice['eleven_api_key'] );
 			}
 		}
 
 		// Business
-		if ( isset( $params['business'] ) ) {
+		if ( isset( $params['business'] ) && is_array( $params['business'] ) ) {
 			$biz = $params['business'];
 
-			$fields = ['profile' => 'context_profile', 'services' => 'context_services', 'rules' => 'context_rules'];
+			$fields = [
+				'profile'  => 'context_profile',
+				'services' => 'context_services',
+				'rules'    => 'context_rules',
+			];
+
 			foreach ( $fields as $key => $meta ) {
-				if ( isset( $biz[$key] ) ) {
-					update_post_meta( $post_id, $this->prefix . $meta, sanitize_textarea_field( $biz[$key] ) );
+				if ( isset( $biz[ $key ] ) ) {
+					update_post_meta(
+						$post_id,
+						$this->prefix . $meta,
+						sanitize_textarea_field( (string) $biz[ $key ] )
+					);
 				}
 			}
 
-			// NEW: Vertical (for smart routing). Optional: only if frontend sends it.
+			// Vertical (routing)
 			if ( isset( $biz['vertical'] ) ) {
-				$vertical = Infrastructure_Registry_Helper::normalize_vertical( sanitize_text_field( $biz['vertical'] ) );
+				$vertical = sanitize_title( (string) $biz['vertical'] );
+				if ( $vertical === '' ) $vertical = 'general';
+
 				update_post_meta( $post_id, '_kurukin_business_vertical', $vertical );
 
-				// Auto-heal assignment + webhook path update if needed
-				Infrastructure_Registry_Helper::ensure_instance_assignment( $post_id );
+				// Auto-heal infra assignment using Tenant_Service (removes dependency on non-existent helper)
+				$user_id = (int) get_current_user_id();
+				if ( $user_id > 0 && class_exists( Tenant_Service::class ) ) {
+					Tenant_Service::ensure_routing_meta( (int) $post_id, $user_id );
+				}
 			}
 		}
 
@@ -143,90 +162,73 @@ class Settings_Controller extends WP_REST_Controller {
 
 	public function validate_credential( $request ) {
 		$params   = $request->get_json_params();
-		$provider = isset($params['provider']) ? $params['provider'] : '';
-		$key      = isset($params['key']) ? $params['key'] : '';
+		$params   = is_array( $params ) ? $params : [];
+		$provider = isset( $params['provider'] ) ? (string) $params['provider'] : '';
+		$key      = isset( $params['key'] ) ? (string) $params['key'] : '';
 
 		if ( strpos( $key, '****' ) !== false ) {
-			return new WP_Error( 'cant_validate', 'No se puede validar una llave oculta.', ['status'=>400] );
+			return new WP_Error( 'cant_validate', 'No se puede validar una llave oculta.', [ 'status' => 400 ] );
 		}
 
 		if ( $provider === 'openai' ) {
 			$res = wp_remote_get( 'https://api.openai.com/v1/models?limit=1', [
-				'headers' => [ 'Authorization' => "Bearer $key" ], 'timeout' => 5
-			]);
-			if ( is_wp_error( $res ) ) return new WP_Error( 'network', $res->get_error_message(), ['status'=>500] );
-			if ( wp_remote_retrieve_response_code( $res ) === 200 ) return [ 'valid' => true, 'message' => 'Conexión OpenAI Exitosa.' ];
-			return new WP_Error( 'invalid', 'Llave OpenAI Incorrecta', ['status'=>400] );
+				'headers' => [ 'Authorization' => "Bearer $key" ],
+				'timeout' => 5,
+			] );
+
+			if ( is_wp_error( $res ) ) {
+				return new WP_Error( 'network', $res->get_error_message(), [ 'status' => 500 ] );
+			}
+
+			if ( wp_remote_retrieve_response_code( $res ) === 200 ) {
+				return [ 'valid' => true, 'message' => 'Conexión OpenAI Exitosa.' ];
+			}
+
+			return new WP_Error( 'invalid', 'Llave OpenAI Incorrecta', [ 'status' => 400 ] );
 		}
 
 		if ( $provider === 'elevenlabs' ) {
 			$res = wp_remote_get( 'https://api.elevenlabs.io/v1/user', [
-				'headers' => [ 'xi-api-key' => $key ], 'timeout' => 5
-			]);
-			if ( is_wp_error( $res ) ) return new WP_Error( 'network', $res->get_error_message(), ['status'=>500] );
-			if ( wp_remote_retrieve_response_code( $res ) === 200 ) {
-				$body  = json_decode( wp_remote_retrieve_body($res), true );
-				$chars = $body['subscription']['character_limit'] - $body['subscription']['character_count'];
-				return [ 'valid' => true, 'message' => "Conectado. Saldo: " . number_format($chars) . " chars." ];
+				'headers' => [ 'xi-api-key' => $key ],
+				'timeout' => 5,
+			] );
+
+			if ( is_wp_error( $res ) ) {
+				return new WP_Error( 'network', $res->get_error_message(), [ 'status' => 500 ] );
 			}
-			return new WP_Error( 'invalid', 'Llave ElevenLabs Incorrecta', ['status'=>400] );
+
+			if ( wp_remote_retrieve_response_code( $res ) === 200 ) {
+				$body  = json_decode( wp_remote_retrieve_body( $res ), true );
+				$limit = (int) ( $body['subscription']['character_limit'] ?? 0 );
+				$used  = (int) ( $body['subscription']['character_count'] ?? 0 );
+				$chars = max( 0, $limit - $used );
+
+				return [ 'valid' => true, 'message' => 'Conectado. Saldo: ' . number_format( $chars ) . ' chars.' ];
+			}
+
+			return new WP_Error( 'invalid', 'Llave ElevenLabs Incorrecta', [ 'status' => 400 ] );
 		}
 
-		return new WP_Error( 'unknown', 'Proveedor desconocido', ['status'=>400] );
+		return new WP_Error( 'unknown', 'Proveedor desconocido', [ 'status' => 400 ] );
 	}
 
 	/**
-	 * Auto-healing tenant record:
-	 * - Find saas_instance for current user
-	 * - If missing, create it
-	 * - Ensure critical metas and infra assignment (stack + webhook)
+	 * Ensures current user has a saas_instance.
+	 * Delegates auto-heal infra routing to Tenant_Service (single source of truth).
 	 */
 	private function ensure_user_instance() {
-		$user_id = get_current_user_id();
-
-		$q = new WP_Query([
-			'post_type'      => 'saas_instance',
-			'author'         => $user_id,
-			'posts_per_page' => 1,
-			'fields'         => 'ids'
-		]);
-
-		if ( ! empty( $q->posts ) ) {
-			$post_id = (int) $q->posts[0];
-
-			// Auto-heal infra assignment (stack_id + webhook url) if missing.
-			Infrastructure_Registry_Helper::ensure_instance_assignment( $post_id );
-
-			return $post_id;
+		$user_id = (int) get_current_user_id();
+		if ( $user_id <= 0 ) {
+			return new WP_Error( 'kurukin_unauthorized', 'Login required', [ 'status' => 401 ] );
 		}
 
-		$user          = wp_get_current_user();
-		$instance_name = sanitize_title( $user->user_login );
+		if ( ! class_exists( Tenant_Service::class ) ) {
+			return new WP_Error( 'kurukin_internal_error', 'Tenant_Service not available', [ 'status' => 500 ] );
+		}
 
-		$post_data = [
-			'post_title'  => 'Bot - ' . $user->user_login,
-			'post_status' => 'publish',
-			'post_type'   => 'saas_instance',
-			'post_author' => $user_id,
-		];
-
-		$post_id = wp_insert_post( $post_data );
-
+		$post_id = Tenant_Service::ensure_user_instance( $user_id );
 		if ( is_wp_error( $post_id ) ) {
 			return $post_id;
-		}
-
-		// Core tenant metadata
-		update_post_meta( $post_id, '_kurukin_evolution_instance_id', $instance_name );
-		update_post_meta( $post_id, '_kurukin_cluster_node', 'alpha-01' );
-
-		// Business vertical default (can be updated later by UI)
-		update_post_meta( $post_id, '_kurukin_business_vertical', 'general' );
-
-		// NEW: assign infra stack + webhook url immediately
-		$assign = Infrastructure_Registry_Helper::ensure_instance_assignment( (int) $post_id );
-		if ( is_wp_error( $assign ) ) {
-			return $assign;
 		}
 
 		return (int) $post_id;
@@ -234,16 +236,16 @@ class Settings_Controller extends WP_REST_Controller {
 
 	private function obfuscate_key( $encrypted_val ) {
 		if ( empty( $encrypted_val ) ) return '';
-		return 'sk-****' . substr( md5($encrypted_val), 0, 4 );
+		return 'sk-****' . substr( md5( (string) $encrypted_val ), 0, 4 );
 	}
 
 	private function update_secure_key( $post_id, $meta_key, $new_val ) {
 		if ( strpos( $new_val, '****' ) !== false ) return;
-		if ( empty( $new_val ) ) return;
+		if ( $new_val === '' ) return;
 
-		$key = defined('KURUKIN_ENCRYPTION_KEY') ? KURUKIN_ENCRYPTION_KEY : wp_salt('auth');
-		$iv  = openssl_random_pseudo_bytes( openssl_cipher_iv_length( "AES-256-CBC" ) );
-		$enc = base64_encode( openssl_encrypt( $new_val, "AES-256-CBC", $key, 0, $iv ) . '::' . $iv );
+		$key = defined( 'KURUKIN_ENCRYPTION_KEY' ) ? KURUKIN_ENCRYPTION_KEY : wp_salt( 'auth' );
+		$iv  = openssl_random_pseudo_bytes( openssl_cipher_iv_length( 'AES-256-CBC' ) );
+		$enc = base64_encode( openssl_encrypt( $new_val, 'AES-256-CBC', $key, 0, $iv ) . '::' . $iv );
 
 		update_post_meta( $post_id, $this->prefix . $meta_key, $enc );
 	}
