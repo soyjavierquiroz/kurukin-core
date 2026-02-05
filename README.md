@@ -170,6 +170,145 @@ Para evitar regresiones por variaciones de schema (camelCase vs snake_case), el 
 
 ---
 
+## 6.1 INCIDENTE: Evolution API v2.3.7 ignora `webhookBase64=true` (Caja negra)
+
+### Síntoma
+
+Aunque se envíe `webhookBase64: true` (y hasta `webhook_base64: true`), Evolution responde y persiste:
+
+* `"webhookBase64": false`
+
+Confirmación: `GET /webhook/find/:instance` devuelve `false` y la tabla Postgres `public."Webhook"` queda en `false`.
+
+### Causa (inferida)
+
+En **Evolution API v2.3.7** (NestJS/Prisma), el backend “sanea”/normaliza el DTO y **fuerza false** al persistir, ignorando el input del cliente.
+No se pudo modificar ni recompilar la API (caja negra).
+
+### Solución definitiva (DB-level)
+
+Se implementó un **TRIGGER en Postgres** que intercepta cualquier `INSERT` o `UPDATE` en `public."Webhook"` y fuerza:
+
+* `NEW."webhookBase64" := true;`
+
+Con esto, aunque la app intente grabar `false`, la DB lo guarda en `true` de forma persistente y automática.
+
+> **Nota:** Esta solución es intencionalmente “enforcement”: aplica a todas las instancias del cluster `evolution2`.
+
+---
+
+## 6.2 Runbook: Trigger Postgres para forzar Base64 (Producción)
+
+### Paso 1: Entrar a psql en el contenedor Postgres (Swarm)
+
+```bash
+export PG_CONT="$(docker ps --format '{{.Names}}' | grep -E 'postgres_pgvector_postgres' | head -n 1)"
+echo "PG_CONT=$PG_CONT"
+
+docker exec -it "$PG_CONT" sh -lc 'psql -U postgres -d evolution2'
+```
+
+### Paso 2: Crear función `force_webhook_base64`
+
+```sql
+CREATE OR REPLACE FUNCTION public.force_webhook_base64()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  -- Forzar siempre Base64 ON sin importar lo que mande la app
+  NEW."webhookBase64" := true;
+  RETURN NEW;
+END;
+$$;
+```
+
+### Paso 3: Crear trigger `trg_enforce_base64` en `"Webhook"`
+
+```sql
+DROP TRIGGER IF EXISTS trg_enforce_base64 ON public."Webhook";
+
+CREATE TRIGGER trg_enforce_base64
+BEFORE INSERT OR UPDATE ON public."Webhook"
+FOR EACH ROW
+EXECUTE FUNCTION public.force_webhook_base64();
+```
+
+### Paso 4: Verificación (UPDATE e INSERT/UPSERT)
+
+**a) Obtener el UUID interno de la instancia (Instance.id) por nombre**
+
+```sql
+SELECT id, name
+FROM public."Instance"
+WHERE name = 'javierquiroz'
+LIMIT 1;
+```
+
+Copia el `id` (uuid) y úsalo abajo como `INSTANCE_UUID`.
+
+**b) UPDATE test (intenta poner false → debe quedar true)**
+
+```sql
+UPDATE public."Webhook"
+SET "webhookBase64" = false,
+    "updatedAt" = NOW()
+WHERE "instanceId" = 'INSTANCE_UUID';
+
+SELECT id, "instanceId", "webhookBase64", "updatedAt"
+FROM public."Webhook"
+WHERE "instanceId" = 'INSTANCE_UUID';
+```
+
+**c) UPSERT test (intenta insertar/actualizar false → debe quedar true)**
+
+```sql
+INSERT INTO public."Webhook"
+  (id, url, enabled, events, "webhookByEvents", "webhookBase64", "createdAt", "updatedAt", "instanceId", headers)
+VALUES
+  ('trg_test_' || replace(gen_random_uuid()::text,'-',''),
+   'http://example.local/webhook/test',
+   true,
+   '["MESSAGES_UPSERT"]'::jsonb,
+   false,
+   false,
+   NOW(),
+   NOW(),
+   'INSTANCE_UUID',
+   NULL)
+ON CONFLICT ("instanceId") DO UPDATE
+SET url = EXCLUDED.url,
+    "webhookBase64" = false,
+    "updatedAt" = NOW();
+
+SELECT id, "instanceId", url, "webhookBase64", "updatedAt"
+FROM public."Webhook"
+WHERE "instanceId" = 'INSTANCE_UUID';
+```
+
+### Confirmar trigger instalado
+
+```sql
+SELECT
+  t.tgname AS trigger_name,
+  pg_get_triggerdef(t.oid) AS definition
+FROM pg_trigger t
+JOIN pg_class c ON c.oid = t.tgrelid
+JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE c.relname = 'Webhook'
+  AND n.nspname = 'public'
+  AND NOT t.tgisinternal;
+```
+
+### Rollback (si se requiere)
+
+```sql
+DROP TRIGGER IF EXISTS trg_enforce_base64 ON public."Webhook";
+DROP FUNCTION IF EXISTS public.force_webhook_base64();
+```
+
+---
+
 ## 7) REST API
 
 ### 7.1 `GET /wp-json/kurukin/v1/config?instance_id=...`
@@ -258,6 +397,8 @@ command -v wp >/dev/null 2>&1 && wp --info || (
 ### 10.2 Setear infra registry (stack) — ejemplo completo
 
 ```bash
+export WP_CONT="$(docker ps --format '{{.Names}}' | grep -E '^kurukin_saas_wordpress\.1\.' | head -n 1)"
+
 docker exec -it "$WP_CONT" sh -lc \
 'wp --allow-root option update kurukin_infra_stacks '\''[
   {
@@ -340,6 +481,7 @@ Solución:
 
 * configurar `webhook_event_type` por stack
 * payload blindado (Sección 6)
+* si Evolution sigue “saneando” a false → activar enforcement DB (Sección 6.2)
 
 ### 11.3 404 en n8n con rutas dinámicas
 
@@ -352,17 +494,6 @@ Solución:
 
 * agregar `n8n_router_id` al stack
 * construir URL final con router UUID
-
-### 11.4 UI “Configuración” no carga (React se queda pegado)
-
-Causa típica:
-
-* Fatal en backend por dependencia inexistente (`Infrastructure_Registry_Helper`)
-
-Solución:
-
-* `Settings_Controller` debe usar `Tenant_Service` como source of truth (auto-heal tenant + routing)
-* al corregir eso, `/settings` vuelve a responder y la UI deja de crashear
 
 ---
 
@@ -390,9 +521,9 @@ Solución:
   * persiste `_kurukin_evolution_webhook_event`
   * persiste `_kurukin_n8n_router_id`
   * `_kurukin_n8n_webhook_url` se trata como **base only**
-* `Settings_Controller`:
+* **SRE/DB Fix (Evolution v2.3.7)**:
 
-  * se elimina dependencia de helper inexistente y se usa `Tenant_Service`
+  * trigger Postgres `trg_enforce_base64` + función `force_webhook_base64()` para forzar `"webhookBase64"=true` en toda escritura
 
 ---
 
@@ -410,3 +541,5 @@ Solución:
 * UI Admin para editar `kurukin_infra_stacks` en vez de WP-CLI.
 * Capacidad/quotas por stack + métricas (round-robin ponderado).
 * Cache de config `/config` por tenant (con invalidación por meta update).
+* Evaluar upgrade de Evolution API cuando upstream corrija el saneamiento de `webhookBase64`.
+

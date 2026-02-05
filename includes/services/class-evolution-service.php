@@ -156,6 +156,7 @@ class Evolution_Service {
 
         $base = untrailingslashit( $base );
 
+        // 🔥 Hardening: if base contains "/webhook/", strip it (fixes old tenants)
         $pos = stripos( $base, '/webhook/' );
         if ( $pos !== false ) {
             $base = rtrim( substr( $base, 0, $pos ), '/' );
@@ -163,7 +164,6 @@ class Evolution_Service {
 
         $router_id = isset( $cfg['n8n_router_id'] ) ? trim( (string) $cfg['n8n_router_id'] ) : '';
         $router_id = preg_replace( '/[^a-fA-F0-9\-]/', '', $router_id );
-
         if ( $router_id === '' ) {
             return new WP_Error( 'config_error', 'Stack n8n_router_id is missing' );
         }
@@ -183,13 +183,15 @@ class Evolution_Service {
 
         $final_url = $base . '/webhook/' . $router_id . '/' . $vertical . '/' . $instance_id;
 
-        // ✅ Payload blindado: camelCase + snake_case
+        // ✅ Blindaje Base64: camelCase + snake_case
         $payload = [
             'webhook' => [
                 'enabled'         => true,
                 'url'             => $final_url,
                 'webhookByEvents' => false,
                 'events'          => [ $event_type ],
+
+                // Evolution builds differ: send both to guarantee
                 'webhookBase64'   => true,
                 'webhook_base64'  => true,
             ],
