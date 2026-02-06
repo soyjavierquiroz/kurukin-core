@@ -6,12 +6,18 @@ use WP_REST_Request;
 use WP_Error;
 use WP_Query;
 
+use Kurukin\Core\Services\Tenant_Service;
+
 if ( ! defined( 'ABSPATH' ) ) { exit; }
 
 class Controller extends WP_REST_Controller {
 
     protected $namespace = 'kurukin/v1';
     protected $resource  = 'config';
+
+    // Simple rate limit (per IP + instance_id)
+    private int $rate_limit_window_seconds = 60;  // 1 min
+    private int $rate_limit_max_requests   = 60;  // 60 req/min
 
     public function __construct() {
         $this->register_routes();
@@ -34,16 +40,41 @@ class Controller extends WP_REST_Controller {
     }
 
     public function check_permission( WP_REST_Request $request ) {
-        $secret   = $request->get_header( 'x_kurukin_secret' ) ?: $request->get_header( 'x-kurukin-secret' );
         $expected = defined( 'KURUKIN_API_SECRET' ) ? (string) KURUKIN_API_SECRET : '';
 
         if ( $expected === '' ) {
-            return new WP_Error( '500', 'Server Secret Missing', [ 'status' => 500 ] );
+            error_log('[Kurukin] /config denied: KURUKIN_API_SECRET missing');
+            return new WP_Error( 'kurukin_secret_missing', 'Server Secret Missing', [ 'status' => 500 ] );
         }
 
-        return hash_equals( $expected, (string) $secret )
-            ? true
-            : new WP_Error( '403', 'Forbidden', [ 'status' => 403 ] );
+        $secret = $request->get_header( 'x_kurukin_secret' );
+        if ( ! $secret ) {
+            $secret = $request->get_header( 'x-kurukin-secret' );
+        }
+
+        $secret = (string) $secret;
+
+        if ( $secret === '' ) {
+            error_log('[Kurukin] /config denied: missing secret header');
+            return new WP_Error( 'kurukin_unauthorized', 'Missing x-kurukin-secret', [ 'status' => 401 ] );
+        }
+
+        if ( ! hash_equals( $expected, $secret ) ) {
+            error_log('[Kurukin] /config denied: bad secret header');
+            return new WP_Error( 'kurukin_forbidden', 'Forbidden', [ 'status' => 403 ] );
+        }
+
+        // Rate limit AFTER secret check
+        $instance_id = strtolower( trim( (string) $request->get_param( 'instance_id' ) ) );
+        $instance_id = preg_replace( '/[^a-z0-9_\-]/', '', $instance_id );
+
+        $ip = $this->get_request_ip();
+        $rl = $this->rate_limit_allow( $ip, $instance_id );
+        if ( is_wp_error( $rl ) ) {
+            return $rl;
+        }
+
+        return true;
     }
 
     public function get_config( WP_REST_Request $request ) {
@@ -52,59 +83,71 @@ class Controller extends WP_REST_Controller {
         $instance_id = preg_replace( '/[^a-z0-9_\-]/', '', $instance_id );
 
         if ( $instance_id === '' ) {
-            return new WP_Error( '400', 'instance_id required', [ 'status' => 400 ] );
+            return new WP_Error( 'kurukin_bad_request', 'instance_id required', [ 'status' => 400 ] );
         }
 
-        // 1) Encontrar el tenant (saas_instance) dueño de ese instance_id
+        // 1) Find tenant (saas_instance) by evolution_instance_id
         $query = new WP_Query([
             'post_type'      => 'saas_instance',
-            'post_status'    => 'publish',
-            'meta_key'       => '_kurukin_evolution_instance_id',
-            'meta_value'     => $instance_id,
+            'post_status'    => [ 'publish', 'private' ],
             'posts_per_page' => 1,
             'fields'         => 'ids',
             'no_found_rows'  => true,
+            'meta_query'     => [
+                [
+                    'key'     => '_kurukin_evolution_instance_id',
+                    'value'   => $instance_id,
+                    'compare' => '=',
+                ],
+            ],
         ]);
 
         if ( empty( $query->posts ) ) {
-            return new WP_Error( '404', 'Instance Not Found', [ 'status' => 404 ] );
+            return new WP_Error( 'kurukin_not_found', 'Instance Not Found', [ 'status' => 404 ] );
         }
 
         $post_id   = (int) $query->posts[0];
         $author_id = (int) get_post_field( 'post_author', $post_id );
 
-        // 2) MemberPress Check (si existe)
+        // 2) MemberPress check (if present)
         if ( class_exists( 'MeprUser' ) ) {
             $mepr_user = new \MeprUser( $author_id );
             if ( ! $mepr_user->is_active() ) {
-                return new WP_Error( '402', 'Payment Required', [ 'status' => 402 ] );
+                return new WP_Error( 'kurukin_payment_required', 'Payment Required', [ 'status' => 402 ] );
             }
         }
 
-        // 3) Recuperar datos tenant
-        $prefix   = '_kurukin_';
-        $vertical = (string) get_post_meta( $post_id, $prefix . 'business_vertical', true );
-        $node     = (string) get_post_meta( $post_id, $prefix . 'cluster_node', true );
-        $prompt   = (string) get_post_meta( $post_id, $prefix . 'system_prompt', true );
+        // 3) Tenant data
+        $prefix = '_kurukin_';
 
+        // Business vertical
+        $vertical = (string) get_post_meta( $post_id, '_kurukin_business_vertical', true );
+        if ( $vertical === '' ) {
+            $vertical = (string) get_post_meta( $post_id, $prefix . 'business_vertical', true ); // legacy fallback
+        }
         $vertical = $vertical !== '' ? sanitize_title( $vertical ) : 'general';
-        $node     = $node !== '' ? sanitize_text_field( $node ) : 'alpha-01';
 
-        // Voz
+        // Node (optional)
+        $node = (string) get_post_meta( $post_id, $prefix . 'cluster_node', true );
+        $node = $node !== '' ? sanitize_text_field( $node ) : '';
+
+        // Prompt
+        $prompt = (string) get_post_meta( $post_id, $prefix . 'system_prompt', true );
+
+        // Voice (ElevenLabs remains per-user optional)
         $voice_enabled = get_post_meta( $post_id, $prefix . 'voice_enabled', true );
         $voice_id      = (string) get_post_meta( $post_id, $prefix . 'eleven_voice_id', true );
         $voice_model   = (string) get_post_meta( $post_id, $prefix . 'eleven_model_id', true );
 
-        // Contexto
+        // IMPORTANT: keep ElevenLabs key support (optional BYOK) for voice only
+        $eleven_key = $this->decrypt( get_post_meta( $post_id, $prefix . 'eleven_api_key', true ) );
+
+        // Context
         $ctx_profile  = (string) get_post_meta( $post_id, $prefix . 'context_profile', true );
         $ctx_services = (string) get_post_meta( $post_id, $prefix . 'context_services', true );
         $ctx_rules    = (string) get_post_meta( $post_id, $prefix . 'context_rules', true );
 
-        // Keys (de negocio)
-        $openai_key = $this->decrypt( get_post_meta( $post_id, $prefix . 'openai_api_key', true ) );
-        $eleven_key = $this->decrypt( get_post_meta( $post_id, $prefix . 'eleven_api_key', true ) );
-
-        // 4) ✅ Infra Multi-tenant: Evolution connection (PRIORIDAD: META DEL TENANT)
+        // 4) Evolution connection (priority: tenant meta)
         $tenant_evo_endpoint = (string) get_post_meta( $post_id, '_kurukin_evolution_endpoint', true );
         $tenant_evo_apikey   = (string) get_post_meta( $post_id, '_kurukin_evolution_apikey', true );
 
@@ -114,54 +157,69 @@ class Controller extends WP_REST_Controller {
         $evo_endpoint = $tenant_evo_endpoint !== '' ? $tenant_evo_endpoint : $fallback_evo_endpoint;
         $evo_apikey   = $tenant_evo_apikey   !== '' ? $tenant_evo_apikey   : $fallback_evo_apikey;
 
-        // Normalización mínima del endpoint (no forzar https; puede ser red interna http)
-        $evo_endpoint = trim( $evo_endpoint );
+        $evo_endpoint = trim( (string) $evo_endpoint );
 
-        // 5) Build Business Data
+        // 5) Business data array
         $business_data = [];
         if ( $ctx_profile !== '' )  { $business_data[] = [ 'category' => 'COMPANY_PROFILE', 'content' => $ctx_profile ]; }
         if ( $ctx_services !== '' ) { $business_data[] = [ 'category' => 'SERVICES_LIST',   'content' => $ctx_services ]; }
         if ( $ctx_rules !== '' )    { $business_data[] = [ 'category' => 'RULES',           'content' => $ctx_rules ]; }
 
-        // 6) ✅ Respuesta final: incluye evolution_connection
+        // 6) ✅ Billing (credits model)
+        $billing = class_exists( Tenant_Service::class )
+            ? Tenant_Service::get_billing_state_by_post_id( $post_id )
+            : [ 'credits_balance' => 0.0, 'can_process' => false ];
+
+        // 7) Response payload (NO OpenAI key anymore)
         $payload = [
-            'status'     => 'success',
-            'instance_id' => $instance_id,
+            'status'       => 'success',
+            'instance_id'  => $instance_id,
+
+            // ✅ Flatten also (per your boss spec)
+            'business_vertical' => $vertical,
 
             'router_logic' => [
                 'workflow_mode' => $vertical,
                 'cluster_node'  => $node,
-                'version'       => '1.3',
+                'version'       => '2.0',
             ],
 
+            // ✅ Centralized AI (no BYOK secrets here)
             'ai_brain' => [
-                'provider'      => 'openai',
-                'api_key'       => $openai_key,
+                'provider'      => 'kurukin',
                 'model'         => 'gpt-4o',
                 'system_prompt' => $prompt,
             ],
 
+            // ✅ Voice BYOK remains optional
             'voice_config' => [
                 'provider' => 'elevenlabs',
                 'enabled'  => (bool) $voice_enabled,
-                'api_key'  => $eleven_key,
+                'api_key'  => $eleven_key,   // empty if not set
                 'voice_id' => $voice_id,
                 'model_id' => $voice_model,
             ],
 
             'business_data' => $business_data,
 
-            // --- ✅ NUEVO BLOQUE MULTI-TENANT PARA N8N ---
             'evolution_connection' => [
                 'endpoint' => $evo_endpoint,
                 'apikey'   => $evo_apikey,
+            ],
+
+            // ✅ REQUIRED by new contract
+            'billing' => [
+                'credits_balance' => (float) ( $billing['credits_balance'] ?? 0.0 ),
+                'can_process'     => (bool) ( $billing['can_process'] ?? false ),
             ],
         ];
 
         $resp = rest_ensure_response( $payload );
 
-        // (Opcional PRO) evita caching si te preocupa que proxies cacheen apikey
-        // $resp->header( 'Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0' );
+        // Avoid caching (sensitive)
+        $resp->header( 'Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0' );
+        $resp->header( 'Pragma', 'no-cache' );
+        $resp->header( 'Expires', '0' );
 
         return $resp;
     }
@@ -181,5 +239,71 @@ class Controller extends WP_REST_Controller {
         if ( $plain === false ) return '';
 
         return (string) $plain;
+    }
+
+    // ---------------------------------------------------------------------
+    // Rate limit helpers
+    // ---------------------------------------------------------------------
+
+    private function get_request_ip(): string {
+        $xff = isset( $_SERVER['HTTP_X_FORWARDED_FOR'] ) ? (string) $_SERVER['HTTP_X_FORWARDED_FOR'] : '';
+        if ( $xff !== '' ) {
+            $parts = explode( ',', $xff );
+            $ip = trim( (string) $parts[0] );
+            if ( $ip !== '' ) return $ip;
+        }
+
+        $rip = isset( $_SERVER['REMOTE_ADDR'] ) ? (string) $_SERVER['REMOTE_ADDR'] : '';
+        return $rip !== '' ? $rip : 'unknown';
+    }
+
+    private function rate_limit_allow( string $ip, string $instance_id ) {
+        $ip = $ip !== '' ? $ip : 'unknown';
+        $instance_id = $instance_id !== '' ? $instance_id : 'unknown';
+
+        if ( defined( 'KURUKIN_CONFIG_RL_MAX' ) ) {
+            $v = (int) KURUKIN_CONFIG_RL_MAX;
+            if ( $v > 0 ) $this->rate_limit_max_requests = $v;
+        }
+        if ( defined( 'KURUKIN_CONFIG_RL_WINDOW' ) ) {
+            $v = (int) KURUKIN_CONFIG_RL_WINDOW;
+            if ( $v > 0 ) $this->rate_limit_window_seconds = $v;
+        }
+
+        $key = 'kurukin_rl_cfg_' . md5( $ip . '|' . $instance_id );
+        $data = get_transient( $key );
+
+        $now = time();
+        if ( ! is_array( $data ) ) {
+            $data = [ 'count' => 0, 'start' => $now ];
+        }
+
+        $start = isset( $data['start'] ) ? (int) $data['start'] : $now;
+        $count = isset( $data['count'] ) ? (int) $data['count'] : 0;
+
+        if ( ( $now - $start ) >= $this->rate_limit_window_seconds ) {
+            $start = $now;
+            $count = 0;
+        }
+
+        $count++;
+
+        $data['start'] = $start;
+        $data['count'] = $count;
+
+        set_transient( $key, $data, $this->rate_limit_window_seconds + 5 );
+
+        if ( $count > $this->rate_limit_max_requests ) {
+            $retry_after = max( 1, $this->rate_limit_window_seconds - ( $now - $start ) );
+            error_log('[Kurukin] /config rate limited: ip=' . $ip . ' instance_id=' . $instance_id . ' count=' . $count);
+
+            return new WP_Error(
+                'kurukin_rate_limited',
+                'Too Many Requests',
+                [ 'status' => 429, 'retry_after' => $retry_after ]
+            );
+        }
+
+        return true;
     }
 }

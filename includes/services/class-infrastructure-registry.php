@@ -132,15 +132,34 @@ class Infrastructure_Registry {
             $candidates = $active;
         }
 
+        if ( empty( $candidates ) ) {
+            return null;
+        }
+
+        // Best-effort RR pointer (avoid losing increments under concurrency by re-reading)
         $ptr_map = get_option( self::OPTION_RR_PTR, [] );
         $ptr_map = is_array( $ptr_map ) ? $ptr_map : [];
 
+        $count = max( 1, count( $candidates ) );
         $idx = isset( $ptr_map[ $vertical ] ) ? (int) $ptr_map[ $vertical ] : 0;
-        $idx = $idx % max( 1, count( $candidates ) );
+        $idx = $idx % $count;
 
         $picked = $candidates[ $idx ] ?? $candidates[0];
 
+        // increment pointer
         $ptr_map[ $vertical ] = $idx + 1;
+
+        // re-read and merge if another process updated between read/write
+        $ptr_map_latest = get_option( self::OPTION_RR_PTR, [] );
+        $ptr_map_latest = is_array( $ptr_map_latest ) ? $ptr_map_latest : [];
+        if ( isset( $ptr_map_latest[ $vertical ] ) ) {
+            $latest = (int) $ptr_map_latest[ $vertical ];
+            // keep the higher pointer to reduce overwrite risk
+            if ( $latest > $ptr_map[ $vertical ] ) {
+                $ptr_map[ $vertical ] = $latest;
+            }
+        }
+
         update_option( self::OPTION_RR_PTR, $ptr_map, false );
 
         return $picked;
@@ -154,10 +173,17 @@ class Infrastructure_Registry {
         $vertical = sanitize_title( $vertical );
 
         return array_values( array_filter( $stacks, static function( $s ) use ( $vertical ) {
+            if ( ! is_array( $s ) ) return false;
             $list = $s['supported_verticals'] ?? [];
             if ( ! is_array( $list ) ) return false;
-            $list = array_map( 'sanitize_title', $list );
-            return in_array( $vertical, $list, true );
+
+            $clean = [];
+            foreach ( $list as $v ) {
+                $vv = sanitize_title( (string) $v );
+                if ( $vv !== '' ) $clean[] = $vv;
+            }
+
+            return in_array( $vertical, $clean, true );
         }));
     }
 
@@ -180,6 +206,7 @@ class Infrastructure_Registry {
      * Validates and normalizes one stack record.
      * Ensures webhook_event_type exists and is a non-empty string.
      * Ensures n8n_router_id exists (empty allowed but should be set in infra).
+     * Normalizes URLs and strips accidental /webhook suffix in n8n_webhook_base.
      */
     private static function normalize_stack( array $s ): array {
         $stack_id = isset( $s['stack_id'] ) ? sanitize_text_field( (string) $s['stack_id'] ) : '';
@@ -188,6 +215,15 @@ class Infrastructure_Registry {
         $evo_endpoint = isset( $s['evolution_endpoint'] ) ? (string) $s['evolution_endpoint'] : '';
         $evo_apikey   = isset( $s['evolution_apikey'] ) ? sanitize_text_field( (string) $s['evolution_apikey'] ) : '';
         $n8n_base     = isset( $s['n8n_webhook_base'] ) ? (string) $s['n8n_webhook_base'] : '';
+
+        // Normalize endpoints (do NOT force https; internal docker http is valid)
+        $evo_endpoint = trim( $evo_endpoint );
+        $evo_endpoint = $evo_endpoint !== '' ? untrailingslashit( $evo_endpoint ) : '';
+
+        $n8n_base = trim( $n8n_base );
+        $n8n_base = $n8n_base !== '' ? untrailingslashit( $n8n_base ) : '';
+        // Safety: strip accidental webhook suffix if misconfigured
+        $n8n_base = preg_replace( '#/webhook(/.*)?$#', '', $n8n_base );
 
         // supported verticals
         $supported = $s['supported_verticals'] ?? [];

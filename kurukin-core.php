@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Kurukin Core (SaaS Engine)
  * Description: Núcleo de automatización para Kurukin IA.
- * Version: 2.7.0
+ * Version: 2.8.0
  * Author: Kurukin Team
  * Text Domain: kurukin-core
  */
@@ -11,8 +11,7 @@ namespace Kurukin\Core;
 
 if ( ! defined( 'ABSPATH' ) ) { exit; }
 
-// --- 1. CONSTANTES ---
-define( 'KURUKIN_CORE_VERSION', '2.7.0' );
+define( 'KURUKIN_CORE_VERSION', '2.8.0' );
 define( 'KURUKIN_CORE_PATH', plugin_dir_path( __FILE__ ) );
 define( 'KURUKIN_CORE_URL', plugin_dir_url( __FILE__ ) );
 
@@ -20,28 +19,13 @@ if ( ! defined( 'KURUKIN_NONCE_ACTION' ) ) {
 	define( 'KURUKIN_NONCE_ACTION', 'kurukin_save_data_action' );
 }
 
-/**
- * Opcionales (fallbacks globales):
- * - Puedes definirlos en wp-config.php si deseas un default de sistema,
- *   pero el enfoque multi-tenant prioriza los meta del tenant (saas_instance)
- *   y luego el registry global (wp_options).
- *
- * define('KURUKIN_EVOLUTION_URL', 'http://evolution_api_v2:8080');
- * define('KURUKIN_EVOLUTION_GLOBAL_KEY', 'xxxxx');
- * define('KURUKIN_N8N_WEBHOOK_BASE', 'http://n8n2:5678');
- */
-
-// --- 2. CARGA DE MÓDULOS ---
 $files = [
-	// Servicios Base / Infra Multi-tenant (v2.7)
 	'includes/services/class-infrastructure-registry.php',
 	'includes/services/class-tenant-service.php',
 
-	// Servicios existentes + Orquestador Evolution
 	'includes/services/class-kurukin-logger.php',
 	'includes/services/class-evolution-service.php',
 
-	// Lógica existente
 	'includes/class-kurukin-fields.php',
 	'includes/services/class-kurukin-bridge.php',
 	'includes/integrations/class-kurukin-memberpress.php',
@@ -49,70 +33,59 @@ $files = [
 
 foreach ( $files as $file ) {
 	$path = KURUKIN_CORE_PATH . $file;
-	if ( file_exists( $path ) ) {
-		require_once $path;
-	}
+	if ( file_exists( $path ) ) require_once $path;
 }
 
 class Plugin {
 
 	public function __construct() {
-		// Core boot
 		add_action( 'init', [ $this, 'register_saas_instance_cpt' ] );
 		add_action( 'rest_api_init', [ $this, 'init_api' ] );
-
-		// Assets (Frontend App)
 		add_action( 'wp_enqueue_scripts', [ $this, 'register_assets' ] );
-
-		// Shortcode fallback (Theme puede renderizar directo el root id)
 		add_shortcode( 'kurukin_connect', [ $this, 'render_frontend_app' ] );
 
-		// Initialize modules if present
-		if ( class_exists( '\Kurukin\Core\Fields' ) ) {
-			new Fields();
-		}
-
-		if ( class_exists( '\Kurukin\Core\Integrations\MemberPress_Integration' ) ) {
-			new Integrations\MemberPress_Integration();
-		}
+		if ( class_exists( '\Kurukin\Core\Fields' ) ) new Fields();
+		if ( class_exists( '\Kurukin\Core\Integrations\MemberPress_Integration' ) ) new Integrations\MemberPress_Integration();
 	}
 
 	public function init_api() {
-		// Controladores REST
 		$controllers = [
 			'includes/api/class-kurukin-api-controller.php'        => 'Kurukin\Core\API\Controller',
 			'includes/api/class-kurukin-connection-controller.php' => 'Kurukin\Core\API\Connection_Controller',
 			'includes/api/class-kurukin-settings-controller.php'   => 'Kurukin\Core\API\Settings_Controller',
+			'includes/api/class-kurukin-wallet-controller.php'     => 'Kurukin\Core\API\Wallet_Controller',
 		];
 
 		foreach ( $controllers as $file => $class ) {
 			$path = KURUKIN_CORE_PATH . $file;
 			if ( file_exists( $path ) ) {
 				require_once $path;
-				if ( class_exists( $class ) ) {
-					new $class();
-				}
+				if ( class_exists( $class ) ) new $class();
 			}
 		}
 	}
 
 	public function register_assets() {
-		// --- CACHE BUSTING AUTOMÁTICO ---
 		$js_url  = KURUKIN_CORE_URL . 'assets/js/connection-app.js';
 		$js_path = KURUKIN_CORE_PATH . 'assets/js/connection-app.js';
+		$js_ver  = file_exists( $js_path ) ? filemtime( $js_path ) : KURUKIN_CORE_VERSION;
 
-		$version = file_exists( $js_path ) ? filemtime( $js_path ) : KURUKIN_CORE_VERSION;
-
-		// Registramos el JS principal con la versión dinámica
 		wp_register_script(
 			'kurukin-app-js',
 			$js_url,
 			[ 'wp-element', 'wp-i18n' ],
-			$version,
+			$js_ver,
 			true
 		);
 
-		// Inyección condicional: Si estamos en la página /app o usamos el shortcode
+		$css_url  = KURUKIN_CORE_URL . 'assets/css/connection-app.css';
+		$css_path = KURUKIN_CORE_PATH . 'assets/css/connection-app.css';
+		$css_ver  = file_exists( $css_path ) ? filemtime( $css_path ) : KURUKIN_CORE_VERSION;
+
+		if ( file_exists( $css_path ) ) {
+			wp_register_style( 'kurukin-app-css', $css_url, [], $css_ver );
+		}
+
 		global $post;
 
 		if (
@@ -126,11 +99,10 @@ class Plugin {
 		}
 	}
 
-	// Helper público para que el Theme pueda llamarlo manualmente si es necesario
 	public function enqueue_app_logic() {
-		if ( ! is_user_logged_in() ) {
-			return;
-		}
+		if ( ! is_user_logged_in() ) return;
+
+		if ( wp_style_is( 'kurukin-app-css', 'registered' ) ) wp_enqueue_style( 'kurukin-app-css' );
 
 		wp_enqueue_script( 'kurukin-app-js' );
 
@@ -138,9 +110,10 @@ class Plugin {
 			'kurukin-app-js',
 			'kurukinSettings',
 			[
-				'root'  => esc_url_raw( rest_url() ),
-				'nonce' => wp_create_nonce( 'wp_rest' ),
-				'user'  => wp_get_current_user()->user_login,
+				'root'    => esc_url_raw( rest_url() ),
+				'nonce'   => wp_create_nonce( 'wp_rest' ),
+				'user'    => wp_get_current_user()->user_login,
+				'version' => KURUKIN_CORE_VERSION,
 			]
 		);
 	}
@@ -150,9 +123,7 @@ class Plugin {
 			return '<div class="p-4 bg-red-900/20 text-red-500 rounded border border-red-900">Inicia sesión.</div>';
 		}
 
-		// Forzamos la carga si se usa shortcode
 		$this->enqueue_app_logic();
-
 		return '<div id="kurukin-app-root"></div>';
 	}
 

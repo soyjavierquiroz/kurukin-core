@@ -10,6 +10,9 @@ class Evolution_Service {
     private int $timeout = 15;
     private int $retries = 2;
 
+    // Retryable HTTP codes (common in swarm/traefik transient failures)
+    private array $retry_http_codes = [ 408, 425, 429, 500, 502, 503, 504 ];
+
     public function connect_and_get_qr( int $user_id ): array|WP_Error {
         $cfg = Tenant_Service::get_tenant_config( $user_id );
         if ( is_wp_error( $cfg ) ) return $cfg;
@@ -37,7 +40,9 @@ class Evolution_Service {
                 ];
             }
 
+            // If instance not found, auto-heal (create + webhook)
             if ( (int) ( $res['code'] ?? 0 ) === 404 ) {
+                $this->log_notice('connect_qr: instance missing, recreating', $cfg, $res);
                 $ok = $this->ensure_instance_exists( $cfg, true );
                 if ( is_wp_error( $ok ) ) return $ok;
 
@@ -57,7 +62,8 @@ class Evolution_Service {
 
         $res = $this->request( 'GET', "instance/connectionState/{$cfg['instance_id']}", null, $cfg );
         if ( is_wp_error( $res ) ) {
-            return [ 'state' => 'network_error', 'message' => $res->get_error_message() ];
+            // Let controller decide how to present to UI
+            return $res;
         }
 
         $data = $res['data'] ?? [];
@@ -74,7 +80,12 @@ class Evolution_Service {
         $cfg = Tenant_Service::get_tenant_config( $user_id );
         if ( is_wp_error( $cfg ) ) return $cfg;
 
-        $this->request( 'DELETE', "instance/delete/{$cfg['instance_id']}", null, $cfg );
+        // Best-effort delete (ignore failure)
+        $del = $this->request( 'DELETE', "instance/delete/{$cfg['instance_id']}", null, $cfg );
+        if ( is_wp_error( $del ) ) {
+            $this->log_notice('reset_instance: delete failed (continuing)', $cfg, [ 'code' => 0, 'url' => '', 'data' => [] ]);
+        }
+
         return $this->connect_and_get_qr( $user_id );
     }
 
@@ -128,6 +139,8 @@ class Evolution_Service {
             if ( $this->looks_like_name_in_use( $joined ) ) return true;
         }
 
+        $this->log_notice('create_instance failed', $cfg, $res);
+
         return new WP_Error( 'kurukin_create_failed', "Create instance failed ({$code}): {$msg}" );
     }
 
@@ -144,11 +157,8 @@ class Evolution_Service {
     /**
      * ✅ WEBHOOK URL PRO:
      * {n8n_base}/webhook/{router_id}/{vertical}/{instance_id}
-     *
-     * Hardening:
-     * - If tenant meta mistakenly includes "/webhook/...", strip to base.
      */
-    private function set_webhook( array $cfg ): true|WP_Error {
+    private function build_n8n_webhook_url( array $cfg ): string|WP_Error {
         $base = isset( $cfg['webhook_url'] ) ? trim( (string) $cfg['webhook_url'] ) : '';
         if ( $base === '' ) {
             return new WP_Error( 'kurukin_missing_webhook', 'Missing n8n webhook base for tenant' );
@@ -156,7 +166,7 @@ class Evolution_Service {
 
         $base = untrailingslashit( $base );
 
-        // 🔥 Hardening: if base contains "/webhook/", strip it (fixes old tenants)
+        // Hardening: if base contains "/webhook/", strip it (fixes old tenants)
         $pos = stripos( $base, '/webhook/' );
         if ( $pos !== false ) {
             $base = rtrim( substr( $base, 0, $pos ), '/' );
@@ -165,7 +175,7 @@ class Evolution_Service {
         $router_id = isset( $cfg['n8n_router_id'] ) ? trim( (string) $cfg['n8n_router_id'] ) : '';
         $router_id = preg_replace( '/[^a-fA-F0-9\-]/', '', $router_id );
         if ( $router_id === '' ) {
-            return new WP_Error( 'config_error', 'Stack n8n_router_id is missing' );
+            return new WP_Error( 'kurukin_config_error', 'Stack n8n_router_id is missing' );
         }
 
         $vertical = isset( $cfg['vertical'] ) ? sanitize_title( (string) $cfg['vertical'] ) : 'general';
@@ -173,21 +183,30 @@ class Evolution_Service {
 
         $instance_id = isset( $cfg['instance_id'] ) ? sanitize_title( (string) $cfg['instance_id'] ) : '';
         if ( $instance_id === '' ) {
-            return new WP_Error( 'config_error', 'Tenant instance_id is missing' );
+            return new WP_Error( 'kurukin_config_error', 'Tenant instance_id is missing' );
         }
+
+        return $base . '/webhook/' . $router_id . '/' . $vertical . '/' . $instance_id;
+    }
+
+    /**
+     * Hardening:
+     * - If tenant meta mistakenly includes "/webhook/...", strip to base.
+     * - Send webhookBase64 in both camelCase + snake_case.
+     */
+    private function set_webhook( array $cfg ): true|WP_Error {
+        $final_url = $this->build_n8n_webhook_url( $cfg );
+        if ( is_wp_error( $final_url ) ) return $final_url;
 
         $event_type = isset( $cfg['webhook_event_type'] ) ? trim( (string) $cfg['webhook_event_type'] ) : '';
         if ( $event_type === '' ) $event_type = Infrastructure_Registry::DEFAULT_WEBHOOK_EVENT_TYPE;
         $event_type = preg_replace( '/[^A-Za-z0-9_\.\-]/', '', $event_type );
         if ( $event_type === '' ) $event_type = Infrastructure_Registry::DEFAULT_WEBHOOK_EVENT_TYPE;
 
-        $final_url = $base . '/webhook/' . $router_id . '/' . $vertical . '/' . $instance_id;
-
-        // ✅ Blindaje Base64: camelCase + snake_case
         $payload = [
             'webhook' => [
                 'enabled'         => true,
-                'url'             => $final_url,
+                'url'             => (string) $final_url,
                 'webhookByEvents' => false,
                 'events'          => [ $event_type ],
 
@@ -204,6 +223,8 @@ class Evolution_Service {
         if ( $code >= 200 && $code < 300 ) return true;
 
         $msg = $this->extract_message( $res['data'] ?? [] );
+        $this->log_notice('set_webhook failed', $cfg, $res);
+
         return new WP_Error( 'kurukin_webhook_failed', "Webhook set failed ({$code}): {$msg}" );
     }
 
@@ -236,6 +257,8 @@ class Evolution_Service {
                 if ( $attempt <= $this->retries && $this->is_timeout_error( $res ) ) {
                     continue;
                 }
+                // no secrets in logs
+                $this->log_notice('request wp_error', $cfg, [ 'code' => 0, 'url' => $url, 'data' => [] ]);
                 return $res;
             }
 
@@ -243,6 +266,13 @@ class Evolution_Service {
             $raw  = (string) wp_remote_retrieve_body( $res );
             $data = json_decode( $raw, true );
             if ( ! is_array( $data ) ) $data = [];
+
+            // Retry some transient HTTP responses
+            if ( $attempt <= $this->retries && in_array( $code, $this->retry_http_codes, true ) ) {
+                $this->log_notice('request retryable http=' . $code, $cfg, [ 'code' => $code, 'url' => $url, 'data' => [] ]);
+                usleep( 250000 ); // 250ms
+                continue;
+            }
 
             return [
                 'code' => $code,
@@ -309,5 +339,24 @@ class Evolution_Service {
         }
 
         return 'Unknown error';
+    }
+
+    /**
+     * Minimal SRE log helper (never logs apikey or full payload).
+     */
+    private function log_notice( string $msg, array $cfg, array $res = [] ): void {
+        $instance = isset( $cfg['instance_id'] ) ? (string) $cfg['instance_id'] : '';
+        $endpoint = isset( $cfg['endpoint'] ) ? (string) $cfg['endpoint'] : '';
+        $code     = isset( $res['code'] ) ? (int) $res['code'] : 0;
+        $url      = isset( $res['url'] ) ? (string) $res['url'] : '';
+
+        // keep it short & safe
+        error_log(
+            '[Kurukin][Evolution] ' . $msg .
+            ' instance=' . $instance .
+            ' code=' . $code .
+            ' endpoint=' . $endpoint .
+            ( $url !== '' ? ' url=' . $url : '' )
+        );
     }
 }

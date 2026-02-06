@@ -9,6 +9,7 @@ if ( ! defined( 'ABSPATH' ) ) { exit; }
 
 // Cargamos la clase con FQN en runtime (evita fatal si no está cargada por include)
 use Kurukin\Core\Services\Evolution_Service;
+use Kurukin\Core\Services\Tenant_Service;
 
 class Connection_Controller extends WP_REST_Controller {
 
@@ -45,25 +46,75 @@ class Connection_Controller extends WP_REST_Controller {
         ]);
     }
 
-    public function permissions_check() {
-        if ( is_user_logged_in() ) return true;
-        return new WP_Error( 'kurukin_unauthorized', 'Login required', [ 'status' => 401 ] );
+    /**
+     * Permission policy (multi-tenant):
+     * - must be logged in
+     * - must have basic capability "read"
+     * - must own the saas_instance OR be admin (manage_options)
+     */
+    public function permissions_check( $request ) {
+        $user_id = (int) get_current_user_id();
+        if ( $user_id <= 0 ) {
+            return new WP_Error( 'kurukin_unauthorized', 'Login required', [ 'status' => 401 ] );
+        }
+
+        // Basic capability gate (keeps compatibility with subscriber-based SaaS)
+        if ( ! current_user_can( 'read' ) ) {
+            error_log('[Kurukin] Connection permissions denied (no-read): user_id=' . $user_id);
+            return new WP_Error( 'kurukin_forbidden', 'Forbidden', [ 'status' => 403 ] );
+        }
+
+        // Admin override
+        if ( current_user_can( 'manage_options' ) ) {
+            return true;
+        }
+
+        // Ensure tenant exists and verify ownership
+        if ( ! class_exists( Tenant_Service::class ) ) {
+            error_log('[Kurukin] Connection permissions denied (Tenant_Service missing): user_id=' . $user_id);
+            return new WP_Error( 'kurukin_internal_error', 'Tenant_Service not available', [ 'status' => 500 ] );
+        }
+
+        $post_id = Tenant_Service::ensure_user_instance( $user_id );
+        if ( is_wp_error( $post_id ) ) {
+            error_log('[Kurukin] Connection permissions denied (ensure_user_instance error): user_id=' . $user_id . ' code=' . $post_id->get_error_code());
+            return $post_id;
+        }
+
+        $post_id    = (int) $post_id;
+        $author_id  = (int) get_post_field( 'post_author', $post_id );
+
+        if ( $author_id !== $user_id ) {
+            error_log('[Kurukin] Connection permissions denied (not-owner): user_id=' . $user_id . ' post_id=' . $post_id . ' author_id=' . $author_id);
+            return new WP_Error( 'kurukin_forbidden', 'Forbidden', [ 'status' => 403 ] );
+        }
+
+        return true;
     }
 
     public function get_status() {
         try {
             $this->assert_service_ready();
 
-            $user_id = get_current_user_id();
+            $user_id = (int) get_current_user_id();
             if ( $user_id <= 0 ) {
                 return new WP_Error( 'kurukin_unauthorized', 'Login required', [ 'status' => 401 ] );
             }
 
-            // Se espera que Evolution_Service devuelva array o WP_Error
             $res = $this->evolution->get_connection_state( $user_id );
 
-            // Si viene WP_Error, lo devolvemos tal cual (REST lo serializa)
-            if ( is_wp_error( $res ) ) return $res;
+            // ✅ IMPORTANT: map WP_Error to a stable UI response
+            if ( is_wp_error( $res ) ) {
+                $msg  = $res->get_error_message();
+                $code = $res->get_error_code();
+
+                // Keep response stable for frontend Badge/status handling
+                return [
+                    'state'   => 'network_error',
+                    'message' => $msg !== '' ? $msg : 'Network error',
+                    'code'    => (string) $code,
+                ];
+            }
 
             // Respuesta estable
             return is_array( $res ) ? $res : [ 'state' => 'unknown' ];
@@ -77,7 +128,7 @@ class Connection_Controller extends WP_REST_Controller {
         try {
             $this->assert_service_ready();
 
-            $user_id = get_current_user_id();
+            $user_id = (int) get_current_user_id();
             if ( $user_id <= 0 ) {
                 return new WP_Error( 'kurukin_unauthorized', 'Login required', [ 'status' => 401 ] );
             }
@@ -97,7 +148,7 @@ class Connection_Controller extends WP_REST_Controller {
         try {
             $this->assert_service_ready();
 
-            $user_id = get_current_user_id();
+            $user_id = (int) get_current_user_id();
             if ( $user_id <= 0 ) {
                 return new WP_Error( 'kurukin_unauthorized', 'Login required', [ 'status' => 401 ] );
             }
