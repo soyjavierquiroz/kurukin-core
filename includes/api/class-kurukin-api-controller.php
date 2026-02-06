@@ -51,7 +51,6 @@ class Controller extends WP_REST_Controller {
         if ( ! $secret ) {
             $secret = $request->get_header( 'x-kurukin-secret' );
         }
-
         $secret = (string) $secret;
 
         if ( $secret === '' ) {
@@ -78,7 +77,7 @@ class Controller extends WP_REST_Controller {
     }
 
     public function get_config( WP_REST_Request $request ) {
-        // 0) instance_id (hardening: only allow a-z0-9_-)
+        // 0) instance_id (hardening)
         $instance_id = strtolower( trim( (string) $request->get_param( 'instance_id' ) ) );
         $instance_id = preg_replace( '/[^a-z0-9_\-]/', '', $instance_id );
 
@@ -131,16 +130,32 @@ class Controller extends WP_REST_Controller {
         $node = (string) get_post_meta( $post_id, $prefix . 'cluster_node', true );
         $node = $node !== '' ? sanitize_text_field( $node ) : '';
 
-        // Prompt
+        // Prompt (ok to expose; no secrets)
         $prompt = (string) get_post_meta( $post_id, $prefix . 'system_prompt', true );
 
-        // Voice (ElevenLabs remains per-user optional)
+        // Voice (ElevenLabs remains optional BYOK)
         $voice_enabled = get_post_meta( $post_id, $prefix . 'voice_enabled', true );
         $voice_id      = (string) get_post_meta( $post_id, $prefix . 'eleven_voice_id', true );
         $voice_model   = (string) get_post_meta( $post_id, $prefix . 'eleven_model_id', true );
 
-        // IMPORTANT: keep ElevenLabs key support (optional BYOK) for voice only
-        $eleven_key = $this->decrypt( get_post_meta( $post_id, $prefix . 'eleven_api_key', true ) );
+        // BYOK flag
+        $byok_enabled = (bool) get_post_meta( $post_id, $prefix . 'eleven_byok_enabled', true );
+
+        // Only decrypt if BYOK enabled (avoid leaking / unnecessary decrypt)
+        $eleven_key = null;
+        $has_byok_key = false;
+        if ( $byok_enabled ) {
+            $raw_enc = get_post_meta( $post_id, $prefix . 'eleven_api_key', true );
+            $dec = $this->decrypt( $raw_enc );
+            $dec = trim( (string) $dec );
+            if ( $dec !== '' ) {
+                $eleven_key = $dec;
+                $has_byok_key = true;
+            } else {
+                $eleven_key = null;
+                $has_byok_key = false;
+            }
+        }
 
         // Context
         $ctx_profile  = (string) get_post_meta( $post_id, $prefix . 'context_profile', true );
@@ -165,17 +180,17 @@ class Controller extends WP_REST_Controller {
         if ( $ctx_services !== '' ) { $business_data[] = [ 'category' => 'SERVICES_LIST',   'content' => $ctx_services ]; }
         if ( $ctx_rules !== '' )    { $business_data[] = [ 'category' => 'RULES',           'content' => $ctx_rules ]; }
 
-        // 6) ✅ Billing (credits model)
+        // 6) Billing (credits model) - include min_required for contract stability
         $billing = class_exists( Tenant_Service::class )
             ? Tenant_Service::get_billing_state_by_post_id( $post_id )
-            : [ 'credits_balance' => 0.0, 'can_process' => false ];
+            : [ 'credits_balance' => 0.0, 'can_process' => false, 'min_required' => 1.0 ];
 
         // 7) Response payload (NO OpenAI key anymore)
         $payload = [
             'status'       => 'success',
-            'instance_id'  => $instance_id,
+            'schema_version' => '2.0.0',
 
-            // ✅ Flatten also (per your boss spec)
+            'instance_id'  => $instance_id,
             'business_vertical' => $vertical,
 
             'router_logic' => [
@@ -184,20 +199,28 @@ class Controller extends WP_REST_Controller {
                 'version'       => '2.0',
             ],
 
-            // ✅ Centralized AI (no BYOK secrets here)
+            // Centralized AI (no BYOK secrets here)
             'ai_brain' => [
                 'provider'      => 'kurukin',
                 'model'         => 'gpt-4o',
                 'system_prompt' => $prompt,
             ],
 
-            // ✅ Voice BYOK remains optional
-            'voice_config' => [
-                'provider' => 'elevenlabs',
-                'enabled'  => (bool) $voice_enabled,
-                'api_key'  => $eleven_key,   // empty if not set
-                'voice_id' => $voice_id,
-                'model_id' => $voice_model,
+            // Voice: BYOK optional exception
+            'voice' => [
+                'provider'      => 'elevenlabs',
+                'enabled'       => (bool) $voice_enabled,
+
+                // Policy flags (important for n8n)
+                'byok_enabled'  => (bool) $byok_enabled,
+                'has_byok_key'  => (bool) $has_byok_key,
+
+                // Only send api_key when BYOK enabled AND key exists
+                'api_key'       => $has_byok_key ? $eleven_key : null,
+
+                // These can still be present; if byok is off, n8n should use admin/global provider config
+                'voice_id'      => $voice_id,
+                'model_id'      => $voice_model,
             ],
 
             'business_data' => $business_data,
@@ -207,10 +230,11 @@ class Controller extends WP_REST_Controller {
                 'apikey'   => $evo_apikey,
             ],
 
-            // ✅ REQUIRED by new contract
+            // REQUIRED by new contract
             'billing' => [
                 'credits_balance' => (float) ( $billing['credits_balance'] ?? 0.0 ),
                 'can_process'     => (bool) ( $billing['can_process'] ?? false ),
+                'min_required'    => (float) ( $billing['min_required'] ?? 1.0 ),
             ],
         ];
 

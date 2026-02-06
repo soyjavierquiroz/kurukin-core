@@ -150,14 +150,18 @@
     );
   };
 
-  const StatBox = ({ label, value, sub }) =>
-    createElement(
+  const StatBox = ({ label, value, sub, statusTone = null }) => {
+    const subCls =
+      statusTone === "good" ? "text-emerald-400" : statusTone === "bad" ? "text-red-300" : "text-surface-500";
+
+    return createElement(
       "div",
       { className: "bg-surface-900 rounded-input p-4 border border-surface-700 text-center" },
       createElement("div", { className: "text-[10px] font-bold text-surface-500 uppercase tracking-widest mb-1" }, label),
       createElement("div", { className: "text-lg font-mono font-medium text-white" }, value),
-      sub && createElement("div", { className: "text-[10px] text-emerald-400 font-medium mt-1" }, sub)
+      sub && createElement("div", { className: `text-[10px] font-medium mt-1 ${subCls}` }, sub)
     );
+  };
 
   const Toast = ({ toast, onClose }) => {
     if (!toast) return null;
@@ -209,18 +213,11 @@
   };
 
   // =========================================================================
-  // API
+  // API (HARDENED: JSON ONLY + sanitize errors)
   // =========================================================================
 
-  const safeParseJSON = (text) => {
-    try { return JSON.parse(text); } catch (e) { return null; }
-  };
-
-  const normalizeRestError = (res, json, rawText) => {
-    const status = res?.status || json?.data?.status || 0;
-    const message = json?.message || rawText || `Error HTTP (${status || "unknown"})`;
-    return { status, message };
-  };
+  const stripHtml = (s) => String(s || "").replace(/<[^>]*>/g, "");
+  const safeShort = (s, n = 180) => stripHtml(s).trim().slice(0, n);
 
   const apiFetch = async (path, method = "GET", body = null) => {
     const opts = { method, headers: { "X-WP-Nonce": kurukinSettings.nonce } };
@@ -240,16 +237,30 @@
       throw new Error(`Red no disponible: ${networkErr?.message || "Network error"}`);
     }
 
-    const json = safeParseJSON(text);
+    const ct = (res.headers.get("content-type") || "").toLowerCase();
 
-    if (json && json.state === "error") throw new Error(json.message || "Error interno del Bot");
-
-    if (!res.ok) {
-      const norm = normalizeRestError(res, json, text);
-      throw new Error(norm.message);
+    // ✅ NEVER allow HTML to propagate to UI
+    if (!ct.includes("application/json")) {
+      throw new Error("Respuesta inválida del servidor (NO JSON). Revisa logs del backend.");
     }
 
-    return json !== null ? json : { success: true, raw: text };
+    let json = null;
+    try {
+      json = JSON.parse(text);
+    } catch (e) {
+      throw new Error("Respuesta inválida del servidor (JSON corrupto).");
+    }
+
+    if (!res.ok) {
+      const msg = json?.message || json?.data?.message || `Error HTTP (${res.status || "unknown"})`;
+      throw new Error(safeShort(msg));
+    }
+
+    if (json && json.state === "error") {
+      throw new Error(safeShort(json.message || "Error interno del Bot"));
+    }
+
+    return json;
   };
 
   const hydrateValidationFromSettings = (data) => {
@@ -276,8 +287,15 @@
   // VIEWS
   // =========================================================================
 
-  const DashboardView = ({ status, qr, loading, doReset, errorMsg, reloadQr }) => {
+  const DashboardView = ({ status, qr, loading, doReset, errorMsg, reloadQr, wallet, refreshingWallet, onRefreshWallet }) => {
     const badgeStatus = mapStatusToBadge(status);
+
+    const balance = typeof wallet?.credits_balance === "number" ? wallet.credits_balance : 0;
+    const canProcess = !!wallet?.can_process;
+    const minReq = typeof wallet?.min_required === "number" ? wallet.min_required : 1;
+
+    const walletSub = canProcess ? "ACTIVO" : "SUSPENDIDO";
+    const walletTone = canProcess ? "good" : "bad";
 
     return createElement(
       Fragment,
@@ -303,6 +321,8 @@
       createElement(
         "div",
         { className: "grid grid-cols-1 lg:grid-cols-12 gap-6" },
+
+        // LEFT: CORE
         createElement(
           Card,
           {
@@ -327,16 +347,42 @@
             )
           ),
 
-          // ✅ Keep 3 columns
+          // ✅ 4 columns responsive (1 col mobile, 2 col sm, 4 col lg)
           createElement(
             "div",
-            { className: "grid grid-cols-1 sm:grid-cols-3 gap-4" },
+            { className: "grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4" },
             createElement(StatBox, { label: "Estado", value: (status || "unknown").toUpperCase() }),
-            createElement(StatBox, { label: "Webhook", value: errorMsg ? "ERROR" : "OK", sub: errorMsg ? "Revisar red" : "Stable" }),
-            createElement(StatBox, { label: "Stack", value: "AUTO" })
+            createElement(StatBox, { label: "Saldo", value: balance.toFixed(2), sub: walletSub, statusTone: walletTone }),
+            createElement(StatBox, { label: "Min", value: minReq.toFixed(2) }),
+            createElement(StatBox, { label: "Webhook", value: errorMsg ? "ERROR" : "OK", sub: errorMsg ? "Revisar red" : "Stable", statusTone: errorMsg ? "bad" : "good" })
+          ),
+
+          createElement(
+            "div",
+            { className: "mt-5 flex flex-col sm:flex-row sm:items-center gap-3" },
+            createElement(
+              "div",
+              { className: "text-xs text-surface-500 leading-relaxed" },
+              !canProcess
+                ? "Sin crédito suficiente: el bot debe pausar."
+                : "Crédito suficiente: el bot puede procesar."
+            ),
+            createElement(
+              Button,
+              {
+                variant: "primary",
+                onClick: onRefreshWallet,
+                disabled: refreshingWallet,
+                isLoading: refreshingWallet,
+                icon: "💳",
+                className: "sm:ml-auto w-full sm:w-auto px-6 py-3", // ✅ NOT full width on desktop
+              },
+              "Actualizar saldo"
+            )
           )
         ),
 
+        // RIGHT: QR
         createElement(
           Card,
           {
@@ -369,18 +415,19 @@
                   loading && !qr
                     ? createElement(
                         "div",
-                        { className: "w-full max-w-[18rem] aspect-square flex flex-col items-center justify-center bg-surface-900 rounded-lg border border-surface-700 shadow-inner" },
+                        { className: "w-full aspect-square flex flex-col items-center justify-center bg-surface-900 rounded-lg border border-surface-700 shadow-inner" },
                         createElement("span", { className: "animate-spin text-3xl mb-4 text-primary-500" }, "⏳"),
                         createElement("span", { className: "text-surface-400 text-xs font-bold tracking-widest animate-pulse" }, "SINCRONIZANDO...")
                       )
                     : qr
                     ? createElement("img", {
                         src: qr,
-                        className: "w-full max-w-[18rem] aspect-square rounded-lg border-4 border-white/90 shadow-2xl object-contain",
+                        // ✅ full width on mobile, fixed width on desktop
+                        className: "w-full sm:w-auto sm:max-w-[20rem] aspect-square rounded-lg border-4 border-white/90 shadow-2xl object-contain",
                       })
                     : createElement(
                         "div",
-                        { className: "w-full max-w-[18rem] aspect-square bg-surface-900 rounded-lg flex items-center justify-center border border-surface-700" },
+                        { className: "w-full aspect-square bg-surface-900 rounded-lg flex items-center justify-center border border-surface-700" },
                         createElement("span", { className: "text-surface-500 text-xs" }, "No QR Data")
                       )
                 ),
@@ -394,7 +441,7 @@
                       onClick: reloadQr,
                       disabled: loading,
                       icon: "🔄",
-                      className: "w-full sm:w-auto px-8 py-3 shadow-lg shadow-primary-500/20",
+                      className: "w-full sm:w-auto px-8 py-3 shadow-lg shadow-primary-500/20", // ✅ not full width desktop
                     },
                     "Actualizar Código QR"
                   ),
@@ -409,7 +456,7 @@
   const WalletView = ({ wallet, refreshing, onRefresh }) => {
     const balance = typeof wallet?.credits_balance === "number" ? wallet.credits_balance : 0;
     const canProcess = !!wallet?.can_process;
-    const threshold = typeof wallet?.threshold === "number" ? wallet.threshold : null;
+    const minReq = typeof wallet?.min_required === "number" ? wallet.min_required : 1;
 
     return createElement(
       "div",
@@ -424,9 +471,9 @@
         createElement(
           "div",
           { className: "grid grid-cols-1 sm:grid-cols-3 gap-4" },
-          createElement(StatBox, { label: "Saldo", value: balance.toFixed(2) }),
-          createElement(StatBox, { label: "Estado", value: canProcess ? "ACTIVO" : "SUSPENDIDO" }),
-          createElement(StatBox, { label: "Umbral", value: threshold === null ? "—" : threshold.toFixed(2) })
+          createElement(StatBox, { label: "Saldo", value: balance.toFixed(2), sub: canProcess ? "ACTIVO" : "SUSPENDIDO", statusTone: canProcess ? "good" : "bad" }),
+          createElement(StatBox, { label: "Min", value: minReq.toFixed(2) }),
+          createElement(StatBox, { label: "Estado", value: canProcess ? "OK" : "PAUSADO" })
         ),
         createElement(
           "div",
@@ -442,11 +489,12 @@
           createElement(
             Button,
             {
-              variant: "secondary",
+              variant: "primary",
               onClick: onRefresh,
               disabled: refreshing,
               isLoading: refreshing,
               className: "sm:ml-auto w-full sm:w-auto px-6 py-3",
+              icon: "💳",
             },
             "Actualizar saldo"
           )
@@ -742,7 +790,6 @@
     };
 
     const canSave = () => {
-      // Save blocked only if BYOK enabled AND dirty key not validated
       const byokEnabled = !!settings?.voice?.byok_enabled;
       const elevenBlocked = byokEnabled && dirty.elevenlabs && validation.elevenlabs.status !== "valid";
       return !elevenBlocked;
@@ -759,7 +806,6 @@
         await apiFetch("settings", "POST", settings);
         showToast("success", "Guardado", "Configuración guardada correctamente.");
         setDirty({ elevenlabs: false });
-        // refresh wallet just in case UI wants to show updated service status later
         loadWallet();
       } catch (e) {
         showToast("error", "Error al guardar", e.message);
@@ -865,13 +911,25 @@
                 className: "text-xs px-4 h-9 rounded-lg",
                 icon: "💳",
               },
-              "Consumo"
+              "Wallet"
             )
           )
         ),
 
         view === "dashboard"
-          ? createElement(DashboardView, { status, qr, loading: loadingQr, doReset, errorMsg, reloadQr: () => loadQr(true) })
+          ? createElement(DashboardView, {
+              status,
+              qr,
+              loading: loadingQr,
+              doReset,
+              errorMsg,
+              reloadQr: () => loadQr(true),
+
+              // ✅ wallet on dashboard
+              wallet,
+              refreshingWallet: walletLoading,
+              onRefreshWallet: loadWallet,
+            })
           : view === "wallet"
           ? createElement(WalletView, { wallet, refreshing: walletLoading, onRefresh: loadWallet })
           : createElement(SettingsView, {

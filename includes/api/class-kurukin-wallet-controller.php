@@ -10,67 +10,78 @@ if ( ! defined( 'ABSPATH' ) ) { exit; }
 
 class Wallet_Controller extends WP_REST_Controller {
 
-    protected $namespace = 'kurukin/v1';
-    protected $resource  = 'wallet';
+	protected $namespace = 'kurukin/v1';
+	protected $resource  = 'wallet';
 
-    public function __construct() {
-        $this->register_routes();
-    }
+	public function __construct() {
+		$this->register_routes();
+	}
 
-    public function register_routes() {
-        register_rest_route( $this->namespace, '/' . $this->resource, [
-            'methods'  => 'GET',
-            'callback' => [ $this, 'get_wallet' ],
-            'permission_callback' => [ $this, 'permissions_check' ],
-        ]);
-    }
+	public function register_routes() {
+		register_rest_route( $this->namespace, '/' . $this->resource, [
+			'methods'  => 'GET',
+			'callback' => [ $this, 'get_wallet' ],
+			'permission_callback' => [ $this, 'permissions_check' ],
+		]);
+	}
 
-    public function permissions_check( $request ) {
-        $user_id = (int) get_current_user_id();
-        if ( $user_id <= 0 ) {
-            return new WP_Error( 'kurukin_unauthorized', 'Login required', [ 'status' => 401 ] );
-        }
+	/**
+	 * - logged in
+	 * - capability read
+	 * - must own saas_instance OR admin
+	 */
+	public function permissions_check( $request ) {
+		$user_id = (int) get_current_user_id();
+		if ( $user_id <= 0 ) {
+			return new WP_Error( 'kurukin_unauthorized', 'Login required', [ 'status' => 401 ] );
+		}
 
-        if ( ! current_user_can( 'read' ) ) {
-            return new WP_Error( 'kurukin_forbidden', 'Forbidden', [ 'status' => 403 ] );
-        }
+		if ( ! current_user_can( 'read' ) ) {
+			return new WP_Error( 'kurukin_forbidden', 'Forbidden', [ 'status' => 403 ] );
+		}
 
-        if ( current_user_can( 'manage_options' ) ) return true;
+		if ( current_user_can( 'manage_options' ) ) return true;
 
-        if ( ! class_exists( Tenant_Service::class ) ) {
-            return new WP_Error( 'kurukin_internal_error', 'Tenant_Service not available', [ 'status' => 500 ] );
-        }
+		if ( ! class_exists( Tenant_Service::class ) ) {
+			return new WP_Error( 'kurukin_internal_error', 'Tenant_Service not available', [ 'status' => 500 ] );
+		}
 
-        $post_id = Tenant_Service::ensure_user_instance( $user_id );
-        if ( is_wp_error( $post_id ) ) return $post_id;
+		$post_id = Tenant_Service::ensure_user_instance( $user_id );
+		if ( is_wp_error( $post_id ) ) return $post_id;
 
-        $post_id   = (int) $post_id;
-        $author_id = (int) get_post_field( 'post_author', $post_id );
+		$author_id = (int) get_post_field( 'post_author', (int) $post_id );
+		if ( $author_id !== $user_id ) {
+			return new WP_Error( 'kurukin_forbidden', 'Forbidden', [ 'status' => 403 ] );
+		}
 
-        if ( $author_id !== $user_id ) {
-            return new WP_Error( 'kurukin_forbidden', 'Forbidden', [ 'status' => 403 ] );
-        }
+		return true;
+	}
 
-        return true;
-    }
+	public function get_wallet() {
+		$user_id = (int) get_current_user_id();
+		if ( $user_id <= 0 ) {
+			return new WP_Error( 'kurukin_unauthorized', 'Login required', [ 'status' => 401 ] );
+		}
 
-    public function get_wallet() {
-        $user_id = (int) get_current_user_id();
-        if ( $user_id <= 0 ) {
-            return new WP_Error( 'kurukin_unauthorized', 'Login required', [ 'status' => 401 ] );
-        }
+		if ( ! class_exists( Tenant_Service::class ) ) {
+			return new WP_Error( 'kurukin_internal_error', 'Tenant_Service not available', [ 'status' => 500 ] );
+		}
 
-        if ( ! class_exists( Tenant_Service::class ) ) {
-            return new WP_Error( 'kurukin_internal_error', 'Tenant_Service not available', [ 'status' => 500 ] );
-        }
+		$billing = Tenant_Service::get_billing_for_user( $user_id );
+		if ( is_wp_error( $billing ) ) return $billing;
 
-        $billing = Tenant_Service::get_billing_state( $user_id );
-        if ( is_wp_error( $billing ) ) return $billing;
+		$payload = [
+			'credits_balance' => (float) ( $billing['credits_balance'] ?? 0.0 ),
+			'can_process'     => (bool)  ( $billing['can_process'] ?? false ),
+			'min_required'    => (float) ( $billing['min_required'] ?? 1.0 ),
+			'source'          => (string) ( $billing['source'] ?? 'meta' ),
+		];
 
-        return [
-            'credits_balance' => (float) ( $billing['credits_balance'] ?? 0.0 ),
-            'can_process'     => (bool)  ( $billing['can_process'] ?? false ),
-            'threshold'       => (float) ( $billing['threshold'] ?? 0.01 ),
-        ];
-    }
+		$resp = rest_ensure_response( $payload );
+		$resp->header( 'Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0' );
+		$resp->header( 'Pragma', 'no-cache' );
+		$resp->header( 'Expires', '0' );
+
+		return $resp;
+	}
 }

@@ -8,6 +8,10 @@ if ( ! defined( 'ABSPATH' ) ) { exit; }
 
 class Tenant_Service {
 
+    // ---------------------------------------------------------------------
+    // Tenant instance lifecycle
+    // ---------------------------------------------------------------------
+
     /**
      * Ensures saas_instance exists for a user and has routing meta assigned.
      * Returns post_id (saas_instance).
@@ -73,6 +77,11 @@ class Tenant_Service {
 
     /**
      * Assign endpoint/apikey/n8n_base/router_id/webhook_event_type based on registry stacks + vertical.
+     *
+     * Pinning rule:
+     * - If endpoint/apikey/n8n_base already exist -> keep them (tenant pinned)
+     * - BUT: if webhook_event_type missing, we still set it
+     * - BUT: if n8n_router_id missing, we still set it
      */
     public static function ensure_routing_meta( int $post_id, int $user_id ): void {
         $endpoint  = (string) get_post_meta( $post_id, '_kurukin_evolution_endpoint', true );
@@ -93,8 +102,7 @@ class Tenant_Service {
         // Pick stack (may be empty array if registry not configured)
         $stack = [];
         if ( class_exists( Infrastructure_Registry::class ) ) {
-            $picked = Infrastructure_Registry::pick_stack_for_vertical( $vertical );
-            $stack = is_array( $picked ) ? $picked : [];
+            $stack = (array) Infrastructure_Registry::pick_stack_for_vertical( $vertical );
         }
 
         // Defaults (global constants)
@@ -159,6 +167,7 @@ class Tenant_Service {
         if ( $router_id === '' ) {
             $router_id = (string) ( $stack['n8n_router_id'] ?? '' );
             $router_id = trim( $router_id );
+            // UUID-ish sanitization
             $router_id = preg_replace( '/[^a-fA-F0-9\-]/', '', $router_id );
             if ( $router_id !== '' ) {
                 update_post_meta( $post_id, '_kurukin_n8n_router_id', sanitize_text_field( $router_id ) );
@@ -182,43 +191,6 @@ class Tenant_Service {
 
             update_post_meta( $post_id, '_kurukin_evolution_webhook_event', sanitize_text_field( $event ) );
         }
-    }
-
-    /**
-     * ✅ Billing getter (simple, local mirror via post_meta)
-     *
-     * Reads:
-     * - _kurukin_credits_balance (string numeric)
-     *
-     * Returns:
-     * [
-     *   'credits_balance' => float,
-     *   'can_process'     => bool,
-     *   'min_required'    => float
-     * ]
-     */
-    public static function get_billing_for_post( int $post_id ): array {
-        $raw = get_post_meta( $post_id, '_kurukin_credits_balance', true );
-        $bal = is_numeric( $raw ) ? (float) $raw : 0.0;
-
-        // Allow system to define minimum threshold (anti-zero edge)
-        $min = defined( 'KURUKIN_MIN_CREDITS' ) ? (float) KURUKIN_MIN_CREDITS : 0.01;
-        if ( $min < 0 ) $min = 0.0;
-
-        return [
-            'credits_balance' => round( $bal, 4 ),
-            'can_process'     => ( $bal > $min ),
-            'min_required'    => $min,
-        ];
-    }
-
-    /**
-     * Convenience: billing for current tenant (by user_id).
-     */
-    public static function get_billing_for_user( int $user_id ): array|WP_Error {
-        $post_id = self::ensure_user_instance( $user_id );
-        if ( is_wp_error( $post_id ) ) return $post_id;
-        return self::get_billing_for_post( (int) $post_id );
     }
 
     /**
@@ -269,5 +241,107 @@ class Tenant_Service {
             'webhook_event_type' => (string) $event,
             'n8n_router_id'      => (string) $router_id,
         ];
+    }
+
+    // ---------------------------------------------------------------------
+    // Billing (Credits) - SAFE GETTERS (pivot to credits model)
+    // ---------------------------------------------------------------------
+
+    /**
+     * Canonical: get billing state by tenant post_id (saas_instance).
+     * Source today: WP post meta mirror `_kurukin_credits_balance` (float).
+     * Later: can be swapped to Wallet_Service/table.
+     */
+    public static function get_billing_for_post( int $post_id ): array {
+        $post_id = (int) $post_id;
+
+        $min_required = self::get_min_required_credits();
+
+        // Credits mirror (meta)
+        $raw = get_post_meta( $post_id, '_kurukin_credits_balance', true );
+
+        $balance = self::to_float( $raw );
+
+        // Allow filter override for advanced billing policies
+        $balance = (float) apply_filters( 'kurukin_credits_balance', $balance, $post_id );
+
+        $can_process = ( $balance > $min_required );
+
+        return [
+            'credits_balance' => (float) $balance,
+            'min_required'    => (float) $min_required,
+            'can_process'     => (bool) $can_process,
+            'source'          => 'meta',
+        ];
+    }
+
+    /**
+     * Canonical: get billing state by user_id (resolves saas_instance first).
+     */
+    public static function get_billing_for_user( int $user_id ): array|WP_Error {
+        $post_id = self::ensure_user_instance( $user_id );
+        if ( is_wp_error( $post_id ) ) return $post_id;
+
+        return self::get_billing_for_post( (int) $post_id );
+    }
+
+    /**
+     * Back-compat alias used by some controllers.
+     * Returns array|WP_Error like get_billing_for_user().
+     */
+    public static function get_billing_state( int $user_id ): array|WP_Error {
+        return self::get_billing_for_user( $user_id );
+    }
+
+    /**
+     * Back-compat alias used by config controllers.
+     * Returns array (no WP_Error) to keep endpoint stable.
+     */
+    public static function get_billing_state_by_post_id( int $post_id ): array {
+        return self::get_billing_for_post( $post_id );
+    }
+
+    /**
+     * Minimum credits required to process messages.
+     * Default: 1.0
+     * Override:
+     * - constant KURUKIN_MIN_REQUIRED_CREDITS
+     * - filter kurukin_min_required_credits
+     */
+    private static function get_min_required_credits(): float {
+        $min = 1.0;
+
+        if ( defined( 'KURUKIN_MIN_REQUIRED_CREDITS' ) ) {
+            $v = (float) KURUKIN_MIN_REQUIRED_CREDITS;
+            if ( $v >= 0 ) $min = $v;
+        }
+
+        $min = (float) apply_filters( 'kurukin_min_required_credits', $min );
+
+        if ( $min < 0 ) $min = 0.0;
+        return $min;
+    }
+
+    /**
+     * Best-effort float conversion from meta values.
+     */
+    private static function to_float( mixed $v ): float {
+        if ( is_float( $v ) || is_int( $v ) ) {
+            return (float) $v;
+        }
+        if ( is_string( $v ) ) {
+            $s = trim( $v );
+            if ( $s === '' ) return 0.0;
+
+            // Accept "500,25" in some locales
+            $s = str_replace( ',', '.', $s );
+
+            // Keep only numeric-ish chars
+            $s = preg_replace( '/[^0-9\.\-]/', '', $s );
+            if ( $s === '' || $s === '-' || $s === '.' ) return 0.0;
+
+            return (float) $s;
+        }
+        return 0.0;
     }
 }
