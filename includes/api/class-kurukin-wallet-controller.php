@@ -2,6 +2,7 @@
 namespace Kurukin\Core\API;
 
 use WP_REST_Controller;
+use WP_REST_Request;
 use WP_Error;
 
 use Kurukin\Core\Services\Tenant_Service;
@@ -25,12 +26,7 @@ class Wallet_Controller extends WP_REST_Controller {
 		]);
 	}
 
-	/**
-	 * - logged in
-	 * - capability read
-	 * - must own saas_instance OR admin
-	 */
-	public function permissions_check( $request ) {
+	public function permissions_check( WP_REST_Request $request ) {
 		$user_id = (int) get_current_user_id();
 		if ( $user_id <= 0 ) {
 			return new WP_Error( 'kurukin_unauthorized', 'Login required', [ 'status' => 401 ] );
@@ -40,24 +36,10 @@ class Wallet_Controller extends WP_REST_Controller {
 			return new WP_Error( 'kurukin_forbidden', 'Forbidden', [ 'status' => 403 ] );
 		}
 
-		if ( current_user_can( 'manage_options' ) ) return true;
-
-		if ( ! class_exists( Tenant_Service::class ) ) {
-			return new WP_Error( 'kurukin_internal_error', 'Tenant_Service not available', [ 'status' => 500 ] );
-		}
-
-		$post_id = Tenant_Service::ensure_user_instance( $user_id );
-		if ( is_wp_error( $post_id ) ) return $post_id;
-
-		$author_id = (int) get_post_field( 'post_author', (int) $post_id );
-		if ( $author_id !== $user_id ) {
-			return new WP_Error( 'kurukin_forbidden', 'Forbidden', [ 'status' => 403 ] );
-		}
-
 		return true;
 	}
 
-	public function get_wallet() {
+	public function get_wallet( WP_REST_Request $request ) {
 		$user_id = (int) get_current_user_id();
 		if ( $user_id <= 0 ) {
 			return new WP_Error( 'kurukin_unauthorized', 'Login required', [ 'status' => 401 ] );
@@ -70,11 +52,18 @@ class Wallet_Controller extends WP_REST_Controller {
 		$billing = Tenant_Service::get_billing_for_user( $user_id );
 		if ( is_wp_error( $billing ) ) return $billing;
 
+		$user = wp_get_current_user();
+		$user_login = ( $user && ! empty( $user->user_login ) ) ? (string) $user->user_login : '';
+
 		$payload = [
 			'credits_balance' => (float) ( $billing['credits_balance'] ?? 0.0 ),
 			'can_process'     => (bool)  ( $billing['can_process'] ?? false ),
 			'min_required'    => (float) ( $billing['min_required'] ?? 1.0 ),
-			'source'          => (string) ( $billing['source'] ?? 'meta' ),
+			'source'          => (string) ( $billing['source'] ?? 'usermeta' ),
+
+			// debug útil
+			'user_id'         => (int) $user_id,
+			'user_login'      => sanitize_title( $user_login ),
 		];
 
 		$resp = rest_ensure_response( $payload );

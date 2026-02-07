@@ -9,12 +9,22 @@ Este plugin desacopla **Usuario (WP User)** de su **Infraestructura (Tenant/Stac
 - **REST API** para que n8n consuma configuración multi-tenant
 - **UI Panel** (Dashboard + Configuración) usando endpoints REST internos
 
+> **Estado UI actual:** se eliminó el UX/CSS que causaba fricción y bugs visuales.  
+> Por ahora quedamos con **esqueleto funcional** (mínimo UI) y el foco es **infra + créditos**.
+
 ---
 
 ## 1) Conceptos clave
 
+### Usuario (WP User) — Identidad estable
+- **Fuente de verdad del usuario:** `wp_users`
+- Identificadores usados:
+  - `user_id` (numérico, estable)
+  - `user_login` (string, estable)
+- **No dependemos de `post_id`** para identidad del usuario (eso varía y rompe).
+
 ### Tenant (CPT `saas_instance`)
-Cada usuario tiene un CPT `saas_instance` (un “tenant record”) donde se guarda el ruteo y configuración:
+Cada usuario puede tener un CPT `saas_instance` (un “tenant record”) donde se guarda el ruteo y configuración:
 
 - `instance_id` (nombre de la instancia en Evolution)
 - endpoint/apikey por tenant (multi-tenant)
@@ -234,58 +244,6 @@ FOR EACH ROW
 EXECUTE FUNCTION public.force_webhook_base64();
 ```
 
-### Paso 4: Verificación (UPDATE e INSERT/UPSERT)
-
-**a) Obtener el UUID interno de la instancia (Instance.id) por nombre**
-
-```sql
-SELECT id, name
-FROM public."Instance"
-WHERE name = 'javierquiroz'
-LIMIT 1;
-```
-
-Copia el `id` (uuid) y úsalo abajo como `INSTANCE_UUID`.
-
-**b) UPDATE test (intenta poner false → debe quedar true)**
-
-```sql
-UPDATE public."Webhook"
-SET "webhookBase64" = false,
-    "updatedAt" = NOW()
-WHERE "instanceId" = 'INSTANCE_UUID';
-
-SELECT id, "instanceId", "webhookBase64", "updatedAt"
-FROM public."Webhook"
-WHERE "instanceId" = 'INSTANCE_UUID';
-```
-
-**c) UPSERT test (intenta insertar/actualizar false → debe quedar true)**
-
-```sql
-INSERT INTO public."Webhook"
-  (id, url, enabled, events, "webhookByEvents", "webhookBase64", "createdAt", "updatedAt", "instanceId", headers)
-VALUES
-  ('trg_test_' || replace(gen_random_uuid()::text,'-',''),
-   'http://example.local/webhook/test',
-   true,
-   '["MESSAGES_UPSERT"]'::jsonb,
-   false,
-   false,
-   NOW(),
-   NOW(),
-   'INSTANCE_UUID',
-   NULL)
-ON CONFLICT ("instanceId") DO UPDATE
-SET url = EXCLUDED.url,
-    "webhookBase64" = false,
-    "updatedAt" = NOW();
-
-SELECT id, "instanceId", url, "webhookBase64", "updatedAt"
-FROM public."Webhook"
-WHERE "instanceId" = 'INSTANCE_UUID';
-```
-
 ### Confirmar trigger instalado
 
 ```sql
@@ -353,23 +311,117 @@ En CLI pueden devolver 401 si no se simula correctamente el contexto de autentic
 
 ---
 
-## 8) Dependencias / Integraciones
+## 8) Créditos (Prioridad del producto)
+
+### 8.1 Fuente de verdad (OFICIAL)
+
+Los créditos se almacenan en **User Meta**:
+
+* Meta key: `_kurukin_credits_balance`
+* Tabla: `wp_usermeta`
+* Usuario: `user_id` / `user_login`
+
+✅ **Fuente oficial:** `wp_usermeta`
+❌ No usar `post_id` para créditos (eso fue un enfoque viejo/incorrecto y causaba “saldo 0”).
+
+### 8.2 Wallet endpoint (usuario logueado)
+
+**GET**:
+
+`/wp-json/kurukin/v1/wallet`
+
+Retorna algo como:
+
+```json
+{
+  "credits_balance": 150,
+  "can_process": true,
+  "min_required": 1,
+  "source": "usermeta",
+  "user_id": 1,
+  "user_login": "javierquiroz"
+}
+```
+
+> Nota: requiere sesión WP. Si no hay login → 401.
+
+### 8.3 Admin endpoint (server-to-server) para cargar créditos
+
+Pensado para Hotmart, QR, recargas, integraciones externas.
+
+**POST**:
+
+`/wp-json/kurukin/v1/admin/credits/set`
+
+Headers:
+
+* `Content-Type: application/json`
+* `x-kurukin-secret: <KURUKIN_API_SECRET>`
+
+Body:
+
+```json
+{
+  "user_login": "javierquiroz",
+  "amount": 50,
+  "mode": "add",
+  "transaction_id": "hotmart:order:ABC123",
+  "note": "Hotmart ABC123"
+}
+```
+
+Ejemplo real (docker -> localhost):
+
+```bash
+export SAAS_WP="kurukin_saas_wordpress.1.xxxxx"
+export KURUKIN_API_SECRET="token_compartido_seguro_n8n_wp_2026"
+
+docker exec -it "$SAAS_WP" curl -sS -X POST "http://localhost/wp-json/kurukin/v1/admin/credits/set" \
+  -H "Content-Type: application/json" \
+  -H "x-kurukin-secret: $KURUKIN_API_SECRET" \
+  -d '{"user_login":"javierquiroz","amount":50,"mode":"add","transaction_id":"ping:saas","note":"ping"}'
+```
+
+Respuesta:
+
+```json
+{
+  "success": true,
+  "message": "Credits updated.",
+  "user_id": 1,
+  "user_login": "javierquiroz",
+  "mode": "add",
+  "amount": 50,
+  "previous_balance": 100,
+  "new_balance": 150,
+  "transaction_id": "ping:saas"
+}
+```
+
+**Idempotencia recomendada:**
+
+* Usar `transaction_id` único por compra/recarga (Hotmart order id, etc).
+* (Roadmap) Guardar ledger/transacciones para evitar doble carga.
+
+---
+
+## 9) Dependencias / Integraciones
 
 * **MemberPress**: si está activo, se valida que el usuario esté activo antes de entregar `/config`.
 * **Evolution API**: servicio externo. Se usa `apikey` por request.
 * **n8n**: recibe webhooks con router UUID + variables.
-* **UI (connection-app.js)**: consume `/settings` y `/connection/*`.
+* **UI (connection-app.js)**: consume `/settings` y `/connection/*` (actualmente UI mínima/esqueleto).
 
 ---
 
-## 9) Configuración de constantes (fallback / legacy)
+## 10) Configuración de constantes (fallback / legacy)
 
 > El diseño actual prioriza **meta del tenant**.
 > Las constantes existen solo como fallback para usuarios legacy.
 
 En `WORDPRESS_CONFIG_EXTRA` o `wp-config.php`:
 
-* `KURUKIN_API_SECRET` *(requerida para /config)*
+* `KURUKIN_API_SECRET` *(requerida para /config y admin credits API)*
 * `KURUKIN_ENCRYPTION_KEY` *(recomendado para decrypt de keys)*
 * `KURUKIN_EVOLUTION_URL` *(fallback legacy)*
 * `KURUKIN_EVOLUTION_GLOBAL_KEY` *(fallback legacy)*
@@ -377,127 +429,53 @@ En `WORDPRESS_CONFIG_EXTRA` o `wp-config.php`:
 
 ---
 
-## 10) Operación / Comandos útiles (WP-CLI)
+## 11) Operación / Comandos útiles
 
 > Ejecutar siempre **dentro del contenedor** WordPress.
 
-### 10.1 Instalar WP-CLI (si el contenedor no lo trae)
+### 11.1 Reset OPcache (si aplica)
 
 ```bash
-export WP_CONT="$(docker ps --format '{{.Names}}' | grep -E '^kurukin_saas_wordpress\.1\.' | head -n 1)"
-
-docker exec -it "$WP_CONT" sh -lc '
-command -v wp >/dev/null 2>&1 && wp --info || (
-  curl -sS -o /usr/local/bin/wp https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar &&
-  chmod +x /usr/local/bin/wp &&
-  wp --info
-)'
+docker exec -it "$SAAS_WP" sh -lc 'php -r "function_exists(\"opcache_reset\") ? (opcache_reset() && print(\"OPCACHE_RESET\n\")) : print(\"NO_OPCACHE\n\");"'
 ```
 
-### 10.2 Setear infra registry (stack) — ejemplo completo
+### 11.2 Probar wallet en contexto autenticado (CLI)
 
 ```bash
-export WP_CONT="$(docker ps --format '{{.Names}}' | grep -E '^kurukin_saas_wordpress\.1\.' | head -n 1)"
-
-docker exec -it "$WP_CONT" sh -lc \
-'wp --allow-root option update kurukin_infra_stacks '\''[
-  {
-    "stack_id":"evo-alpha-01",
-    "active":true,
-    "evolution_endpoint":"http://evolution_api_v2:8080",
-    "evolution_apikey":"XXX",
-    "n8n_webhook_base":"http://n8n-v2_n8n_v2_webhook:5678",
-    "n8n_router_id":"e699da51-5467-4e2c-989e-de0d82fffc23",
-    "supported_verticals":["multinivel","general"],
-    "webhook_event_type":"MESSAGES_UPSERT"
-  }
-]'\'''
-```
-
-### 10.3 Ver metas críticas del tenant (ej: post_id=18)
-
-```bash
-docker exec -it "$WP_CONT" sh -lc \
-'wp --allow-root eval '\''$id=18;
-echo "VERT:".get_post_meta($id,"_kurukin_business_vertical",true)."\n";
-echo "INSTANCE:".get_post_meta($id,"_kurukin_evolution_instance_id",true)."\n";
-echo "EVO:".get_post_meta($id,"_kurukin_evolution_endpoint",true)."\n";
-echo "EVENT:".get_post_meta($id,"_kurukin_evolution_webhook_event",true)."\n";
-echo "ROUTER:".get_post_meta($id,"_kurukin_n8n_router_id",true)."\n";
-echo "N8N_BASE:".get_post_meta($id,"_kurukin_n8n_webhook_url",true)."\n";'\'''
-```
-
-### 10.4 Probar QR end-to-end (fuerza set_webhook)
-
-```bash
-docker exec -it "$WP_CONT" sh -lc \
-'wp --allow-root eval '\''$svc=new \Kurukin\Core\Services\Evolution_Service();
-$r=$svc->connect_and_get_qr(1);
-if(is_wp_error($r)) echo "ERR: ".$r->get_error_message()."\n";
-else echo "OK base64_len=".strlen($r["base64"]??"")."\n";'\'''
-```
-
-### 10.5 Probar `/config` por REST dentro de WP
-
-```bash
-docker exec -it "$WP_CONT" sh -lc "wp --allow-root eval '
-\$req = new WP_REST_Request(\"GET\", \"/kurukin/v1/config\");
-\$req->set_param(\"instance_id\", \"javierquiroz\");
-\$req->set_header(\"x-kurukin-secret\", defined(\"KURUKIN_API_SECRET\") ? KURUKIN_API_SECRET : \"\");
-\$res = rest_do_request(\$req);
-echo wp_json_encode(\$res->get_data(), JSON_PRETTY_PRINT).PHP_EOL;
-'"
+docker exec -it "$SAAS_WP" sh -lc 'php -r '\''require_once "/var/www/html/wp-load.php";
+$u=get_user_by("login","javierquiroz"); if(!$u){echo "NO USER\n"; exit;}
+wp_set_current_user($u->ID);
+$req=new WP_REST_Request("GET","/kurukin/v1/wallet");
+$res=rest_do_request($req);
+echo wp_json_encode($res->get_data(), JSON_PRETTY_PRINT)."\n";'\'''
 ```
 
 ---
 
-## 11) Troubleshooting
+## 12) Troubleshooting
 
-### 11.1 DNS interno (Docker Swarm / overlay)
-
-Si ves `cURL error 6: Could not resolve host`, revisa:
-
-* que WordPress y Evolution estén en la **misma network overlay**
-* usa el **alias correcto** del servicio (ej: `evolution_api_v2`, no `evolution_evolution_api`)
-
-Desde el contenedor WordPress:
-
-```bash
-docker exec -it "$WP_CONT" sh -lc '
-getent hosts evolution_api_v2 || true
-curl -sS -D- http://evolution_api_v2:8080/ -o /dev/null | head -n 12 || true
-'
-```
-
-### 11.2 Error 400 en webhook/set (Evolution)
+### 12.1 Wallet muestra 0 pero usermeta tiene saldo
 
 Causas típicas:
 
-* Falta wrapper `webhook` (Evolution v2 lo exige)
-* Evento inválido (debe ser enum permitido por esa versión)
-* Falta `webhookBase64` / incompatibilidad camelCase vs snake_case
+* UI no autenticada (401) → se queda en 0
+* JS cacheado/versión vieja
+* Endpoint leyendo una fuente antigua (postmeta) en legacy
 
 Solución:
 
-* configurar `webhook_event_type` por stack
-* payload blindado (Sección 6)
-* si Evolution sigue “saneando” a false → activar enforcement DB (Sección 6.2)
+* Confirmar que `/wallet` devuelve `source: "usermeta"` y el saldo correcto
+* Asegurar cache-busting del JS (usar `filemtime()` al encolar)
+* Verificar en el navegador Network → request a `/wallet` status 200/401
 
-### 11.3 404 en n8n con rutas dinámicas
+### 12.2 Admin credits endpoint da 403/401
 
-Causa:
-
-* Falta el router UUID. n8n exige:
-  `/webhook/{ROUTER_UUID}/:vertical/:instance_id`
-
-Solución:
-
-* agregar `n8n_router_id` al stack
-* construir URL final con router UUID
+* 401: falta header `x-kurukin-secret`
+* 403: secret incorrecto (no coincide con `KURUKIN_API_SECRET` definido en el server)
 
 ---
 
-## 12) Changelog (resumen de cambios recientes)
+## 13) Changelog (resumen de cambios recientes)
 
 * Multi-tenant real: Evolution endpoint/apikey salen del meta del tenant (no de constantes).
 * REST `/config`:
@@ -521,25 +499,31 @@ Solución:
   * persiste `_kurukin_evolution_webhook_event`
   * persiste `_kurukin_n8n_router_id`
   * `_kurukin_n8n_webhook_url` se trata como **base only**
+* **Créditos (fix crítico):**
+
+  * **Fuente oficial:** `wp_usermeta` meta `_kurukin_credits_balance`
+  * `GET /kurukin/v1/wallet` devuelve saldo desde usermeta (y ya no depende de post_id)
+  * `POST /kurukin/v1/admin/credits/set` permite recargas server-to-server (Hotmart/QR/etc) usando `x-kurukin-secret`
+* **UI/UX:**
+
+  * se eliminó el UX/CSS que estaba rompiendo la experiencia → queda **esqueleto funcional** por ahora
 * **SRE/DB Fix (Evolution v2.3.7)**:
 
   * trigger Postgres `trg_enforce_base64` + función `force_webhook_base64()` para forzar `"webhookBase64"=true` en toda escritura
 
 ---
 
-## 13) Seguridad (nota operativa)
+## 14) Seguridad (nota operativa)
 
-* `/config` requiere `x-kurukin-secret`.
+* `/config` y admin credits API requieren `x-kurukin-secret`.
 * API keys de OpenAI/ElevenLabs se guardan cifradas (AES-256-CBC) y se desencriptan al servir config.
 * Las credenciales de Evolution se entregan a n8n porque n8n actúa como “worker/orchestrator” por tenant.
 
 ---
 
-## 14) Próximos pasos sugeridos (roadmap corto)
+## 15) Roadmap corto
 
-* Validación automática de “stack health” (ping Evolution/n8n) antes de asignar.
-* UI Admin para editar `kurukin_infra_stacks` en vez de WP-CLI.
-* Capacidad/quotas por stack + métricas (round-robin ponderado).
-* Cache de config `/config` por tenant (con invalidación por meta update).
-* Evaluar upgrade de Evolution API cuando upstream corrija el saneamiento de `webhookBase64`.
-
+* Ledger de transacciones de créditos (idempotencia real por `transaction_id`).
+* UI admin para editar `kurukin_infra_stacks` en vez de WP-CLI.
+* Cache de `/config` por tenant con invalidación por meta update.
+* Upgrade de Evolution API cuando upstream corrija el saneamiento de `webhookBase64`.

@@ -50,10 +50,13 @@ class Plugin {
 
 	public function init_api() {
 		$controllers = [
-			'includes/api/class-kurukin-api-controller.php'        => 'Kurukin\Core\API\Controller',
-			'includes/api/class-kurukin-connection-controller.php' => 'Kurukin\Core\API\Connection_Controller',
-			'includes/api/class-kurukin-settings-controller.php'   => 'Kurukin\Core\API\Settings_Controller',
-			'includes/api/class-kurukin-wallet-controller.php'     => 'Kurukin\Core\API\Wallet_Controller',
+			'includes/api/class-kurukin-api-controller.php'            => 'Kurukin\Core\API\Controller',
+			'includes/api/class-kurukin-connection-controller.php'     => 'Kurukin\Core\API\Connection_Controller',
+			'includes/api/class-kurukin-settings-controller.php'       => 'Kurukin\Core\API\Settings_Controller',
+			'includes/api/class-kurukin-wallet-controller.php'         => 'Kurukin\Core\API\Wallet_Controller',
+
+			// ✅ ADMIN credits endpoint (Hotmart/QR/N8N)
+			'includes/api/class-kurukin-admin-credits-controller.php'  => 'Kurukin\Core\API\Admin_Credits_Controller',
 		];
 
 		foreach ( $controllers as $file => $class ) {

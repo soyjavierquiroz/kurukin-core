@@ -244,26 +244,42 @@ class Tenant_Service {
     }
 
     // ---------------------------------------------------------------------
-    // Billing (Credits) - SAFE GETTERS (pivot to credits model)
+    // Billing (Credits) - OFFICIAL SOURCE: USERMETA
     // ---------------------------------------------------------------------
 
     /**
-     * Canonical: get billing state by tenant post_id (saas_instance).
-     * Source today: WP post meta mirror `_kurukin_credits_balance` (float).
-     * Later: can be swapped to Wallet_Service/table.
+     * Canonical: get billing state by user_id (OFFICIAL SOURCE: usermeta).
+     * meta_key: _kurukin_credits_balance
      */
-    public static function get_billing_for_post( int $post_id ): array {
-        $post_id = (int) $post_id;
+    public static function get_billing_for_user( int $user_id ): array|WP_Error {
+        if ( $user_id <= 0 ) {
+            return new WP_Error( 'kurukin_invalid_user', 'Invalid user_id' );
+        }
 
         $min_required = self::get_min_required_credits();
 
-        // Credits mirror (meta)
-        $raw = get_post_meta( $post_id, '_kurukin_credits_balance', true );
+        // ✅ OFFICIAL SOURCE: usermeta
+        $raw_user = get_user_meta( $user_id, '_kurukin_credits_balance', true );
+        $balance  = self::to_float( $raw_user );
 
-        $balance = self::to_float( $raw );
+        // If empty, try legacy fallback from saas_instance postmeta and auto-migrate
+        if ( $balance <= 0 && (string)$raw_user === '' ) {
+            $post_id = self::ensure_user_instance( $user_id );
+            if ( ! is_wp_error( $post_id ) ) {
+                $legacy_raw = get_post_meta( (int) $post_id, '_kurukin_credits_balance', true );
+                $legacy_val = self::to_float( $legacy_raw );
 
-        // Allow filter override for advanced billing policies
-        $balance = (float) apply_filters( 'kurukin_credits_balance', $balance, $post_id );
+                if ( $legacy_val > 0 ) {
+                    // ✅ auto-migrate -> usermeta
+                    update_user_meta( $user_id, '_kurukin_credits_balance', (string) $legacy_val );
+                    clean_user_cache( $user_id );
+                    $balance = (float) $legacy_val;
+                }
+            }
+        }
+
+        // Filter override
+        $balance = (float) apply_filters( 'kurukin_credits_balance', $balance, 0, $user_id );
 
         $can_process = ( $balance > $min_required );
 
@@ -271,23 +287,54 @@ class Tenant_Service {
             'credits_balance' => (float) $balance,
             'min_required'    => (float) $min_required,
             'can_process'     => (bool) $can_process,
-            'source'          => 'meta',
+            'source'          => 'usermeta',
+            'user_id'         => (int) $user_id,
         ];
     }
 
     /**
-     * Canonical: get billing state by user_id (resolves saas_instance first).
+     * Canonical: get billing state by tenant post_id (saas_instance).
+     * For compatibility: resolves post_author -> reads usermeta as source of truth.
+     * Also migrates legacy postmeta to usermeta if needed.
      */
-    public static function get_billing_for_user( int $user_id ): array|WP_Error {
-        $post_id = self::ensure_user_instance( $user_id );
-        if ( is_wp_error( $post_id ) ) return $post_id;
+    public static function get_billing_for_post( int $post_id ): array {
+        $post_id = (int) $post_id;
+        $user_id = (int) get_post_field( 'post_author', $post_id );
 
-        return self::get_billing_for_post( (int) $post_id );
+        // If no author, fallback to legacy postmeta (rare edge)
+        if ( $user_id <= 0 ) {
+            $min_required = self::get_min_required_credits();
+            $raw = get_post_meta( $post_id, '_kurukin_credits_balance', true );
+            $balance = self::to_float( $raw );
+            $balance = (float) apply_filters( 'kurukin_credits_balance', $balance, $post_id, 0 );
+            return [
+                'credits_balance' => (float) $balance,
+                'min_required'    => (float) $min_required,
+                'can_process'     => (bool) ( $balance > $min_required ),
+                'source'          => 'postmeta',
+                'post_id'         => (int) $post_id,
+            ];
+        }
+
+        $r = self::get_billing_for_user( $user_id );
+        if ( is_wp_error( $r ) ) {
+            // fallback safe (should not happen)
+            return [
+                'credits_balance' => 0.0,
+                'min_required'    => (float) self::get_min_required_credits(),
+                'can_process'     => false,
+                'source'          => 'usermeta',
+                'user_id'         => (int) $user_id,
+                'post_id'         => (int) $post_id,
+            ];
+        }
+
+        $r['post_id'] = (int) $post_id;
+        return $r;
     }
 
     /**
      * Back-compat alias used by some controllers.
-     * Returns array|WP_Error like get_billing_for_user().
      */
     public static function get_billing_state( int $user_id ): array|WP_Error {
         return self::get_billing_for_user( $user_id );
@@ -295,7 +342,6 @@ class Tenant_Service {
 
     /**
      * Back-compat alias used by config controllers.
-     * Returns array (no WP_Error) to keep endpoint stable.
      */
     public static function get_billing_state_by_post_id( int $post_id ): array {
         return self::get_billing_for_post( $post_id );
@@ -304,9 +350,6 @@ class Tenant_Service {
     /**
      * Minimum credits required to process messages.
      * Default: 1.0
-     * Override:
-     * - constant KURUKIN_MIN_REQUIRED_CREDITS
-     * - filter kurukin_min_required_credits
      */
     private static function get_min_required_credits(): float {
         $min = 1.0;
@@ -333,7 +376,7 @@ class Tenant_Service {
             $s = trim( $v );
             if ( $s === '' ) return 0.0;
 
-            // Accept "500,25" in some locales
+            // Accept "500,25"
             $s = str_replace( ',', '.', $s );
 
             // Keep only numeric-ish chars
