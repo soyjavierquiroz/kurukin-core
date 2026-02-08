@@ -43,6 +43,56 @@
 
   const now = () => Math.floor(Date.now() / 1000);
 
+  /**
+   * Formatea balances con micro-decimales:
+   * - mínimo 2 decimales
+   * - máximo 6 decimales
+   * - si hay micro-fracción, se muestra (no se “congela” en 150.00)
+   *
+   * Acepta string ("149.979517") o número.
+   */
+  const formatBalance = (amount) => {
+    let s = (amount ?? "0").toString().trim();
+    if (!s) s = "0";
+
+    // Normaliza separador decimal
+    s = s.replace(/,/g, ".");
+
+    // Limpia caracteres (mantén dígitos, punto y signo)
+    s = s.replace(/[^0-9.\-]/g, "");
+    if (!s || s === "-" || s === ".") s = "0";
+
+    // Asegura decimal
+    if (!s.includes(".")) s += ".000000";
+
+    let neg = false;
+    if (s.startsWith("-")) {
+      neg = true;
+      s = s.slice(1);
+    }
+
+    let [i, d = ""] = s.split(".");
+    if (!i) i = "0";
+
+    // Limita a 6 decimales (ya debería venir así del backend)
+    d = (d + "000000").slice(0, 6);
+
+    // Quita ceros al final, pero deja mínimo 2
+    d = d.replace(/0+$/, "");
+    if (d.length < 2) d = d.padEnd(2, "0");
+
+    const normalized = (neg ? "-" : "") + `${i}.${d}`;
+
+    // Intl para separadores de miles (ya controlado a <=6 decimales)
+    const num = Number(normalized);
+    if (!Number.isFinite(num)) return normalized;
+
+    return new Intl.NumberFormat("en-US", {
+      minimumFractionDigits: 2,
+      maximumFractionDigits: 6,
+    }).format(num);
+  };
+
   const apiFetch = async (path, method = "GET", body = null) => {
     const url = kurukinSettings.root.replace(/\/$/, "") + "/kurukin/v1/" + path.replace(/^\//, "");
 
@@ -214,7 +264,11 @@
     const st = state.status || "unknown";
     const msg = state.statusMsg || "";
     const w = state.wallet || {};
-    const bal = Number(w.credits_balance ?? 0);
+
+    // IMPORTANTE: credits_balance viene como string con 6 decimales desde backend
+    const balStr = w.credits_balance ?? "0";
+    const balFmt = formatBalance(balStr);
+
     const min = Number(w.min_required ?? 1);
     const can = !!w.can_process;
 
@@ -235,7 +289,7 @@
         </div>
         <div style="border:1px solid #333; padding:10px;">
           <div><b>Saldo</b></div>
-          <div style="font-family:monospace;">${esc(bal.toFixed(2))}</div>
+          <div style="font-family:monospace;">${esc(balFmt)}</div>
         </div>
         <div style="border:1px solid #333; padding:10px;">
           <div><b>Min</b></div>
