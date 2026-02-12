@@ -29,6 +29,10 @@ $files = [
 	'includes/class-kurukin-fields.php',
 	'includes/services/class-kurukin-bridge.php',
 	'includes/integrations/class-kurukin-memberpress.php',
+	'includes/integrations/mepr-dump-tx.php',
+
+	// ✅ NEW: Credits hooks + cron + logs table
+	'includes/services/class-kurukin-credits.php',
 ];
 
 foreach ( $files as $file ) {
@@ -44,8 +48,30 @@ class Plugin {
 		add_action( 'wp_enqueue_scripts', [ $this, 'register_assets' ] );
 		add_shortcode( 'kurukin_connect', [ $this, 'render_frontend_app' ] );
 
+		// Activation / deactivation hooks
+		register_activation_hook( __FILE__, [ __CLASS__, 'activate' ] );
+		register_deactivation_hook( __FILE__, [ __CLASS__, 'deactivate' ] );
+
 		if ( class_exists( '\Kurukin\Core\Fields' ) ) new Fields();
 		if ( class_exists( '\Kurukin\Core\Integrations\MemberPress_Integration' ) ) new Integrations\MemberPress_Integration();
+
+		// ✅ Boot credits system (hooks + cron)
+		if ( class_exists( '\Kurukin\Core\Services\Credits_Service' ) ) {
+			Services\Credits_Service::boot();
+		}
+	}
+
+	public static function activate() {
+		if ( class_exists( '\Kurukin\Core\Services\Credits_Service' ) ) {
+			Services\Credits_Service::install();
+			Services\Credits_Service::ensure_cron();
+		}
+	}
+
+	public static function deactivate() {
+		if ( class_exists( '\Kurukin\Core\Services\Credits_Service' ) ) {
+			Services\Credits_Service::unschedule_cron();
+		}
 	}
 
 	public function init_api() {

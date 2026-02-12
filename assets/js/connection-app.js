@@ -41,29 +41,33 @@
 
   const setHTML = (html) => (rootEl.innerHTML = html);
 
-  const now = () => Math.floor(Date.now() / 1000);
+  /**
+   * Inserta separadores de miles sin tocar decimales.
+   * Ej: "12345" -> "12,345"
+   */
+  const addThousands = (intStr) => {
+    const s = String(intStr || "0");
+    // evita regex pesada con negativos, el negativo se maneja afuera
+    return s.replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+  };
 
   /**
-   * Formatea balances con micro-decimales:
-   * - mínimo 2 decimales
-   * - máximo 6 decimales
-   * - si hay micro-fracción, se muestra (no se “congela” en 150.00)
-   *
-   * Acepta string ("149.979517") o número.
+   * Formatea balances SIEMPRE con 6 decimales fijos.
+   * - Entrada: string ("149.979517") o número.
+   * - Salida: "150.000000" o "149.979517"
+   * - No recorta ceros.
+   * - Limpia caracteres extraños.
    */
-  const formatBalance = (amount) => {
+  const formatBalanceFixed6 = (amount) => {
     let s = (amount ?? "0").toString().trim();
     if (!s) s = "0";
 
     // Normaliza separador decimal
     s = s.replace(/,/g, ".");
 
-    // Limpia caracteres (mantén dígitos, punto y signo)
+    // Mantén dígitos, punto y signo
     s = s.replace(/[^0-9.\-]/g, "");
     if (!s || s === "-" || s === ".") s = "0";
-
-    // Asegura decimal
-    if (!s.includes(".")) s += ".000000";
 
     let neg = false;
     if (s.startsWith("-")) {
@@ -71,26 +75,29 @@
       s = s.slice(1);
     }
 
+    // Si tiene más de un ".", conserva solo el primero (defensivo)
+    const firstDot = s.indexOf(".");
+    if (firstDot !== -1) {
+      const before = s.slice(0, firstDot);
+      const after = s.slice(firstDot + 1).replace(/\./g, "");
+      s = before + "." + after;
+    }
+
+    // Asegura partes
     let [i, d = ""] = s.split(".");
     if (!i) i = "0";
 
-    // Limita a 6 decimales (ya debería venir así del backend)
+    // Normaliza ceros a la izquierda en entero (pero deja al menos "0")
+    i = i.replace(/^0+(?=\d)/, "");
+    if (i === "") i = "0";
+
+    // EXACTAMENTE 6 decimales (pad o truncate)
     d = (d + "000000").slice(0, 6);
 
-    // Quita ceros al final, pero deja mínimo 2
-    d = d.replace(/0+$/, "");
-    if (d.length < 2) d = d.padEnd(2, "0");
+    // Separadores de miles (UX) manteniendo fixed decimals
+    const intFmt = addThousands(i);
 
-    const normalized = (neg ? "-" : "") + `${i}.${d}`;
-
-    // Intl para separadores de miles (ya controlado a <=6 decimales)
-    const num = Number(normalized);
-    if (!Number.isFinite(num)) return normalized;
-
-    return new Intl.NumberFormat("en-US", {
-      minimumFractionDigits: 2,
-      maximumFractionDigits: 6,
-    }).format(num);
+    return (neg ? "-" : "") + `${intFmt}.${d}`;
   };
 
   const apiFetch = async (path, method = "GET", body = null) => {
@@ -265,11 +272,14 @@
     const msg = state.statusMsg || "";
     const w = state.wallet || {};
 
-    // IMPORTANTE: credits_balance viene como string con 6 decimales desde backend
+    // credits_balance viene como string con 6 decimales desde backend (ideal)
     const balStr = w.credits_balance ?? "0";
-    const balFmt = formatBalance(balStr);
+    const balFmt = formatBalanceFixed6(balStr);
 
-    const min = Number(w.min_required ?? 1);
+    // min_required puede venir string o number: lo mostramos también fixed 6 para consistencia
+    const minStr = w.min_required ?? "1";
+    const minFmt = formatBalanceFixed6(minStr);
+
     const can = !!w.can_process;
 
     const qrHtml =
@@ -293,7 +303,7 @@
         </div>
         <div style="border:1px solid #333; padding:10px;">
           <div><b>Min</b></div>
-          <div style="font-family:monospace;">${esc(min.toFixed(2))}</div>
+          <div style="font-family:monospace;">${esc(minFmt)}</div>
         </div>
         <div style="border:1px solid #333; padding:10px;">
           <div><b>Puede Procesar</b></div>
@@ -432,11 +442,9 @@ ${esc(JSON.stringify(s, null, 2))}
     act("reset_instance", resetInstance);
     act("refresh_settings", loadSettings);
     act("save_settings", () => {
-      // pull values from inputs into state.settings
       if (!state.settings) return;
 
       const s = JSON.parse(JSON.stringify(state.settings));
-
       const get = (sel) => rootEl.querySelector(sel);
 
       const sp = get('[data-field="system_prompt"]')?.value ?? "";
