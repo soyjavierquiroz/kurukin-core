@@ -16,9 +16,8 @@ class Credits_Service {
 	 * Boot hooks (MemberPress + Cron).
 	 */
 	public static function boot() {
-		// MemberPress: transaction completed (alta/renovación).
-		// Big Boss indicó: mepr-event-transaction-completed (o similar).
-		add_action( 'mepr-event-transaction-completed', [ __CLASS__, 'on_mepr_transaction_completed' ], 10, 1 );
+		// MemberPress credits are handled by Integrations\MemberPress_Integration
+		// to support membership-based mapping + strict idempotency.
 
 		// MemberPress: cancel/expire (marcar ventana de gracia 1 año).
 		// Cubrimos varios posibles eventos (no estorba si alguno no existe).
@@ -316,6 +315,97 @@ class Credits_Service {
 		$fa = (float) self::normalize_decimal_6( $a );
 		$fb = (float) self::normalize_decimal_6( $b );
 		return self::format_6( $fa + $fb );
+	}
+
+	/**
+	 * Suma créditos a un usuario usando la fuente de verdad del saldo (usermeta)
+	 * y registra auditoría en la tabla de logs cuando existe.
+	 *
+	 * @param int    $user_id Usuario objetivo.
+	 * @param mixed  $amount  Monto de crédito (se normaliza a 6 decimales).
+	 * @param string $reason  Tipo de movimiento, ej: memberpress_purchase/memberpress_renewal.
+	 * @param array  $context Contexto opcional (source/ref/note/txn_id/product_id/subscription_id).
+	 *
+	 * @return array|WP_Error
+	 */
+	public static function add_credits( $user_id, $amount, $reason, array $context = [] ) {
+		$user_id = (int) $user_id;
+		if ( $user_id <= 0 ) {
+			return new WP_Error( 'invalid_user', 'Usuario inválido para acreditar créditos.' );
+		}
+
+		$amount = self::normalize_decimal_6( $amount );
+		if ( (float) $amount <= 0 ) {
+			return new WP_Error( 'invalid_amount', 'El monto a acreditar debe ser mayor que 0.' );
+		}
+
+		$prev = self::get_balance_decimal( $user_id );
+		$new  = self::decimal_add( $prev, $amount );
+
+		update_user_meta( $user_id, self::META_BALANCE, $new );
+		clean_user_cache( $user_id );
+
+		$user       = get_user_by( 'id', $user_id );
+		$user_login = $user ? (string) $user->user_login : '';
+		$type       = sanitize_key( (string) $reason );
+		if ( $type === '' ) {
+			$type = 'credit_add';
+		}
+
+		$source = isset( $context['source'] ) ? sanitize_text_field( (string) $context['source'] ) : 'kurukin_core';
+		$ref    = isset( $context['ref'] ) ? sanitize_text_field( (string) $context['ref'] ) : null;
+		$note   = isset( $context['note'] ) ? sanitize_text_field( (string) $context['note'] ) : '';
+
+		if ( $note === '' ) {
+			$audit_ctx = [
+				'txn_id'          => isset( $context['txn_id'] ) ? (string) $context['txn_id'] : '',
+				'product_id'      => isset( $context['product_id'] ) ? (string) $context['product_id'] : '',
+				'subscription_id' => isset( $context['subscription_id'] ) ? (string) $context['subscription_id'] : '',
+			];
+			$note = wp_json_encode( $audit_ctx, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES );
+		}
+
+		global $wpdb;
+		$table = self::log_table();
+		$exists = (string) $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $table ) ) === $table;
+
+		if ( $exists ) {
+			self::log_credit_movement( [
+				'user_id'        => $user_id,
+				'user_login'     => $user_login,
+				'type'           => $type,
+				'amount'         => $amount,
+				'currency'       => 'USD',
+				'balance_before' => $prev,
+				'balance_after'  => $new,
+				'source'         => $source,
+				'ref'            => $ref,
+				'note'           => $note,
+			] );
+		} elseif ( defined( 'WP_DEBUG' ) && WP_DEBUG ) {
+			error_log(
+				'[KurukinCredits][MemberPress] Tabla de logs no disponible. Movimiento: ' .
+				wp_json_encode(
+					[
+						'user_id'        => $user_id,
+						'type'           => $type,
+						'amount'         => $amount,
+						'balance_before' => $prev,
+						'balance_after'  => $new,
+						'source'         => $source,
+						'ref'            => $ref,
+					],
+					JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES
+				)
+			);
+		}
+
+		return [
+			'user_id'        => $user_id,
+			'amount'         => $amount,
+			'balance_before' => $prev,
+			'balance_after'  => $new,
+		];
 	}
 
 	/**

@@ -17,8 +17,16 @@ class Evolution_Service {
         $cfg = Tenant_Service::get_tenant_config( $user_id );
         if ( is_wp_error( $cfg ) ) return $cfg;
 
-        if ( empty( $cfg['endpoint'] ) || empty( $cfg['apikey'] ) || empty( $cfg['instance_id'] ) ) {
-            return new WP_Error( 'kurukin_missing_routing', 'Tenant routing config missing (endpoint/apikey/instance_id)' );
+        if ( empty( $cfg['endpoint'] ) || empty( $cfg['instance_id'] ) ) {
+            return new WP_Error(
+                'kurukin_missing_routing',
+                'Configuración incompleta para conectar con Evolution.',
+                [
+                    'status'          => 500,
+                    'upstream_status' => 0,
+                    'hint'            => 'Verifica endpoint, instance_id y API key de Evolution.',
+                ]
+            );
         }
 
         $ok = $this->ensure_instance_exists( $cfg );
@@ -53,7 +61,15 @@ class Evolution_Service {
             sleep( 1 );
         }
 
-        return new WP_Error( 'kurukin_qr_timeout', 'Timeout esperando QR' );
+        return new WP_Error(
+            'kurukin_qr_timeout',
+            'No se pudo obtener el QR a tiempo.',
+            [
+                'status'          => 504,
+                'upstream_status' => 504,
+                'hint'            => 'Intenta nuevamente en unos segundos.',
+            ]
+        );
     }
 
     public function get_connection_state( int $user_id ): array|WP_Error {
@@ -141,7 +157,17 @@ class Evolution_Service {
 
         $this->log_notice('create_instance failed', $cfg, $res);
 
-        return new WP_Error( 'kurukin_create_failed', "Create instance failed ({$code}): {$msg}" );
+        return new WP_Error(
+            'kurukin_create_failed',
+            "No se pudo crear la instancia en Evolution ({$code}).",
+            [
+                'status'               => 502,
+                'upstream_status'      => $code,
+                'hint'                 => $this->hint_for_upstream_status( $code ),
+                'upstream_message'     => $msg,
+                'upstream_body_preview'=> $this->preview_text( (string) ( $res['raw'] ?? '' ) ),
+            ]
+        );
     }
 
     private function looks_like_name_in_use( string $msg ): bool {
@@ -225,65 +251,151 @@ class Evolution_Service {
         $msg = $this->extract_message( $res['data'] ?? [] );
         $this->log_notice('set_webhook failed', $cfg, $res);
 
-        return new WP_Error( 'kurukin_webhook_failed', "Webhook set failed ({$code}): {$msg}" );
+        return new WP_Error(
+            'kurukin_webhook_failed',
+            "No se pudo configurar el webhook de Evolution ({$code}).",
+            [
+                'status'               => 502,
+                'upstream_status'      => $code,
+                'hint'                 => $this->hint_for_upstream_status( $code ),
+                'upstream_message'     => $msg,
+                'upstream_body_preview'=> $this->preview_text( (string) ( $res['raw'] ?? '' ) ),
+            ]
+        );
     }
 
     private function request( string $method, string $path, ?array $body, array $cfg ): array|WP_Error {
         $base = untrailingslashit( (string) $cfg['endpoint'] );
         $url  = $base . '/' . ltrim( $path, '/' );
 
-        $args = [
-            'method'    => strtoupper( $method ),
-            'headers'   => [
-                'Content-Type' => 'application/json',
-                'Accept'       => 'application/json',
-                'apikey'       => (string) $cfg['apikey'],
-            ],
-            'timeout'   => $this->timeout,
-            'sslverify' => false,
-        ];
-
-        if ( ! empty( $body ) ) {
-            $args['body'] = wp_json_encode( $body );
+        $auth_candidates = $this->resolve_auth_candidates( $cfg );
+        if ( empty( $auth_candidates ) ) {
+            return new WP_Error(
+                'kurukin_missing_routing',
+                'No hay API key disponible para Evolution.',
+                [
+                    'status'          => 500,
+                    'upstream_status' => 0,
+                    'hint'            => 'Configura la API key del tenant o KURUKIN_EVOLUTION_GLOBAL_KEY.',
+                ]
+            );
         }
 
-        $attempt = 0;
+        $body_json = ! empty( $body ) ? wp_json_encode( $body ) : null;
 
-        do {
-            $attempt++;
-            $res = wp_remote_request( $url, $args );
+        foreach ( $auth_candidates as $index => $auth ) {
+            $attempt = 0;
 
-            if ( is_wp_error( $res ) ) {
-                if ( $attempt <= $this->retries && $this->is_timeout_error( $res ) ) {
+            do {
+                $attempt++;
+                $headers = $this->build_auth_headers( (string) $auth['key'] );
+                $args = [
+                    'method'    => strtoupper( $method ),
+                    'headers'   => $headers,
+                    'timeout'   => $this->timeout,
+                    'sslverify' => false,
+                ];
+
+                if ( null !== $body_json ) {
+                    $args['body'] = $body_json;
+                }
+
+                $this->debug_http( 'request', [
+                    'method'      => strtoupper( $method ),
+                    'url'         => $url,
+                    'auth_source' => (string) $auth['source'],
+                    'headers'     => $this->masked_headers( $headers ),
+                    'attempt'     => $attempt,
+                ] );
+
+                $res = wp_remote_request( $url, $args );
+
+                if ( is_wp_error( $res ) ) {
+                    if ( $attempt <= $this->retries && $this->is_timeout_error( $res ) ) {
+                        continue;
+                    }
+
+                    $this->log_notice( 'request wp_error', $cfg, [ 'code' => 0, 'url' => $url, 'data' => [] ] );
+                    $this->debug_http( 'request_wp_error', [
+                        'method'      => strtoupper( $method ),
+                        'url'         => $url,
+                        'auth_source' => (string) $auth['source'],
+                        'error'       => $res->get_error_message(),
+                    ] );
+
+                    return new WP_Error(
+                        'kurukin_upstream_request_failed',
+                        'No se pudo conectar con Evolution.',
+                        [
+                            'status'          => 502,
+                            'upstream_status' => 0,
+                            'hint'            => 'Revisa conectividad hacia Evolution y la URL configurada.',
+                            'upstream_message'=> $res->get_error_message(),
+                        ]
+                    );
+                }
+
+                $code = (int) wp_remote_retrieve_response_code( $res );
+                $raw  = (string) wp_remote_retrieve_body( $res );
+                $data = json_decode( $raw, true );
+                if ( ! is_array( $data ) ) {
+                    $data = [];
+                }
+
+                $this->debug_http( 'response', [
+                    'method'       => strtoupper( $method ),
+                    'url'          => $url,
+                    'status'       => $code,
+                    'auth_source'  => (string) $auth['source'],
+                    'body_preview' => $this->preview_text( $raw ),
+                ] );
+
+                // 401 con key tenant: intenta con key global como fallback.
+                if ( $code === 401 && $index < ( count( $auth_candidates ) - 1 ) ) {
+                    $this->log_notice( 'request unauthorized, trying fallback auth', $cfg, [ 'code' => $code, 'url' => $url, 'data' => [] ] );
+                    break;
+                }
+
+                // Retry some transient HTTP responses
+                if ( $attempt <= $this->retries && in_array( $code, $this->retry_http_codes, true ) ) {
+                    $this->log_notice( 'request retryable http=' . $code, $cfg, [ 'code' => $code, 'url' => $url, 'data' => [] ] );
+                    usleep( 250000 ); // 250ms
                     continue;
                 }
-                // no secrets in logs
-                $this->log_notice('request wp_error', $cfg, [ 'code' => 0, 'url' => $url, 'data' => [] ]);
-                return $res;
-            }
 
-            $code = (int) wp_remote_retrieve_response_code( $res );
-            $raw  = (string) wp_remote_retrieve_body( $res );
-            $data = json_decode( $raw, true );
-            if ( ! is_array( $data ) ) $data = [];
+                if ( $code === 401 ) {
+                    return new WP_Error(
+                        'kurukin_upstream_unauthorized',
+                        'No autorizado con Evolution.',
+                        [
+                            'status'               => 502,
+                            'upstream_status'      => 401,
+                            'hint'                 => 'Revisa la API key y el host de Evolution configurados.',
+                            'upstream_body_preview'=> $this->preview_text( $raw ),
+                        ]
+                    );
+                }
 
-            // Retry some transient HTTP responses
-            if ( $attempt <= $this->retries && in_array( $code, $this->retry_http_codes, true ) ) {
-                $this->log_notice('request retryable http=' . $code, $cfg, [ 'code' => $code, 'url' => $url, 'data' => [] ]);
-                usleep( 250000 ); // 250ms
-                continue;
-            }
+                return [
+                    'code'       => $code,
+                    'raw'        => $raw,
+                    'data'       => $data,
+                    'url'        => $url,
+                    'auth_source'=> (string) $auth['source'],
+                ];
 
-            return [
-                'code' => $code,
-                'raw'  => $raw,
-                'data' => $data,
-                'url'  => $url,
-            ];
+            } while ( $attempt <= $this->retries );
+        }
 
-        } while ( $attempt <= $this->retries );
-
-        return new WP_Error( 'kurukin_request_failed', 'Request failed after retries' );
+        return new WP_Error(
+            'kurukin_request_failed',
+            'No se pudo completar la solicitud a Evolution.',
+            [
+                'status'          => 502,
+                'upstream_status' => 0,
+                'hint'            => 'Intenta nuevamente. Si persiste, revisa logs de integración.',
+            ]
+        );
     }
 
     private function is_timeout_error( WP_Error $err ): bool {
@@ -291,6 +403,92 @@ class Evolution_Service {
         if ( stripos( $msg, 'cURL error 28' ) !== false ) return true;
         if ( stripos( $msg, 'timed out' ) !== false ) return true;
         return false;
+    }
+
+    private function resolve_auth_candidates( array $cfg ): array {
+        $tenant_key = trim( (string) ( $cfg['apikey'] ?? '' ) );
+        $global_key = defined( 'KURUKIN_EVOLUTION_GLOBAL_KEY' ) ? trim( (string) KURUKIN_EVOLUTION_GLOBAL_KEY ) : '';
+
+        $candidates = [];
+        if ( $tenant_key !== '' ) {
+            $candidates[] = [ 'source' => 'tenant', 'key' => $tenant_key ];
+        }
+        if ( $global_key !== '' && $global_key !== $tenant_key ) {
+            $candidates[] = [ 'source' => 'global', 'key' => $global_key ];
+        }
+
+        return $candidates;
+    }
+
+    private function build_auth_headers( string $apikey ): array {
+        return [
+            'Content-Type'  => 'application/json',
+            'Accept'        => 'application/json',
+            'apikey'        => $apikey,
+            'x-api-key'     => $apikey,
+            'Authorization' => 'Bearer ' . $apikey,
+        ];
+    }
+
+    private function mask_secret( string $value ): string {
+        $value = trim( $value );
+        $len   = strlen( $value );
+        if ( $len <= 8 ) {
+            return str_repeat( '*', $len );
+        }
+
+        return substr( $value, 0, 4 ) . str_repeat( '*', max( 4, $len - 7 ) ) . substr( $value, -3 );
+    }
+
+    private function masked_headers( array $headers ): array {
+        $safe = $headers;
+        foreach ( [ 'apikey', 'x-api-key', 'Authorization' ] as $key ) {
+            if ( ! isset( $safe[ $key ] ) ) {
+                continue;
+            }
+            $raw = (string) $safe[ $key ];
+            if ( stripos( $raw, 'Bearer ' ) === 0 ) {
+                $token = trim( substr( $raw, 7 ) );
+                $safe[ $key ] = 'Bearer ' . $this->mask_secret( $token );
+            } else {
+                $safe[ $key ] = $this->mask_secret( $raw );
+            }
+        }
+
+        return $safe;
+    }
+
+    private function preview_text( string $text, int $limit = 280 ): string {
+        $clean = preg_replace( '/\s+/', ' ', trim( $text ) );
+        $clean = (string) $clean;
+        if ( strlen( $clean ) > $limit ) {
+            return substr( $clean, 0, $limit ) . '...';
+        }
+        return $clean;
+    }
+
+    private function hint_for_upstream_status( int $status ): string {
+        if ( $status === 401 ) {
+            return 'No autorizado con Evolution, revisa key/host.';
+        }
+        if ( $status === 404 ) {
+            return 'Endpoint de Evolution no encontrado. Revisa la URL configurada.';
+        }
+        if ( $status >= 500 ) {
+            return 'Evolution devolvió error interno. Intenta de nuevo en unos minutos.';
+        }
+        return 'Revisa configuración de Evolution (URL/API key) e inténtalo nuevamente.';
+    }
+
+    private function debug_http( string $message, array $context = [] ): void {
+        if ( ! ( defined( 'WP_DEBUG' ) && WP_DEBUG ) ) {
+            return;
+        }
+
+        error_log(
+            '[Kurukin][Evolution][Debug] ' . $message .
+            ( ! empty( $context ) ? ' | ' . wp_json_encode( $context, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES ) : '' )
+        );
     }
 
     private function flatten_any_to_string( mixed $v ): string {
@@ -345,6 +543,10 @@ class Evolution_Service {
      * Minimal SRE log helper (never logs apikey or full payload).
      */
     private function log_notice( string $msg, array $cfg, array $res = [] ): void {
+        if ( ! ( defined( 'WP_DEBUG' ) && WP_DEBUG ) ) {
+            return;
+        }
+
         $instance = isset( $cfg['instance_id'] ) ? (string) $cfg['instance_id'] : '';
         $endpoint = isset( $cfg['endpoint'] ) ? (string) $cfg['endpoint'] : '';
         $code     = isset( $res['code'] ) ? (int) $res['code'] : 0;

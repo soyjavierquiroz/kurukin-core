@@ -29,7 +29,9 @@ $files = [
 	'includes/class-kurukin-fields.php',
 	'includes/services/class-kurukin-bridge.php',
 	'includes/integrations/class-kurukin-memberpress.php',
+	'includes/integrations/class-kurukin-memberpress-credits.php',
 	'includes/integrations/mepr-dump-tx.php',
+	'includes/admin/class-kurukin-admin-memberpress-credits.php',
 
 	// ✅ NEW: Credits hooks + cron + logs table
 	'includes/services/class-kurukin-credits.php',
@@ -54,6 +56,8 @@ class Plugin {
 
 		if ( class_exists( '\Kurukin\Core\Fields' ) ) new Fields();
 		if ( class_exists( '\Kurukin\Core\Integrations\MemberPress_Integration' ) ) new Integrations\MemberPress_Integration();
+		if ( class_exists( '\Kurukin\Core\Integrations\MemberPress_Credits_Integration' ) ) new Integrations\MemberPress_Credits_Integration();
+		if ( is_admin() && class_exists( '\Kurukin\Core\Admin\MemberPress_Credits_Admin' ) ) new Admin\MemberPress_Credits_Admin();
 
 		// ✅ Boot credits system (hooks + cron)
 		if ( class_exists( '\Kurukin\Core\Services\Credits_Service' ) ) {
@@ -65,6 +69,9 @@ class Plugin {
 		if ( class_exists( '\Kurukin\Core\Services\Credits_Service' ) ) {
 			Services\Credits_Service::install();
 			Services\Credits_Service::ensure_cron();
+		}
+		if ( class_exists( '\Kurukin\Core\Integrations\MemberPress_Credits_Integration' ) ) {
+			Integrations\MemberPress_Credits_Integration::ensure_default_rules();
 		}
 	}
 

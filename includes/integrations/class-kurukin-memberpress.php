@@ -28,10 +28,17 @@ class MemberPress_Integration {
      */
     private const KURUKIN_USERMETA_VERTICAL  = '_kurukin_vertical';
     private const KURUKIN_INSTANCE_META_VERT = '_kurukin_business_vertical';
+    private const KURUKIN_CREDITS_BALANCE    = '_kurukin_credits_balance';
+    private const TX_META_PREFIX             = '_kurukin_mp_initial_credit_tx_';
+    private const SUB_META_PREFIX            = '_kurukin_mp_initial_credit_sub_';
+    private const LOG_PREFIX                 = '[kurukin-core][memberpress]';
 
     public function __construct() {
         // Esperar a que plugins estén cargados antes de tocar MemberPress.
         add_action( 'plugins_loaded', [ $this, 'bootstrap' ], 20 );
+
+        // Fallback: normaliza perfil al crear usuario (MemberPress crea con email en algunos flujos).
+        add_action( 'user_register', [ $this, 'handle_user_register' ], 20, 2 );
 
         // Fallback: primer login
         add_action( 'wp_login', [ $this, 'handle_wp_login' ], 20, 2 );
@@ -63,11 +70,14 @@ class MemberPress_Integration {
     public function handle_transaction_completed_event( $event ): void {
         try {
             if ( ! is_object( $event ) || ! method_exists( $event, 'get_data' ) ) {
+                $this->debug( 'hook skip: invalid event payload', [
+                    'hook' => 'mepr-event-transaction-completed',
+                ] );
                 return;
             }
 
             $txn = $event->get_data();
-            $this->provision_from_txn( $txn, 'mepr-event-transaction-completed' );
+            $this->handle_transaction( $txn, 'mepr-event-transaction-completed' );
         } catch ( \Throwable $e ) {
             $this->log( 'memberpress: handle_transaction_completed_event error', [
                 'error' => $e->getMessage(),
@@ -77,10 +87,21 @@ class MemberPress_Integration {
 
     public function handle_transaction_status_complete( $txn ): void {
         try {
-            $this->provision_from_txn( $txn, 'mepr-txn-status-complete' );
+            $this->handle_transaction( $txn, 'mepr-txn-status-complete' );
         } catch ( \Throwable $e ) {
             $this->log( 'memberpress: handle_transaction_status_complete error', [
                 'error' => $e->getMessage(),
+            ] );
+        }
+    }
+
+    public function handle_user_register( int $user_id, array $userdata ): void {
+        try {
+            $this->normalize_user_profile( $user_id, 'user_register' );
+        } catch ( \Throwable $e ) {
+            $this->debug( 'hook error: user_register', [
+                'user_id' => $user_id,
+                'error'   => $e->getMessage(),
             ] );
         }
     }
@@ -116,6 +137,8 @@ class MemberPress_Integration {
                 'vertical' => $vertical,
                 'post_id'  => $post_id,
             ] );
+
+            $this->normalize_user_profile( $user_id, 'wp_login' );
         } catch ( \Throwable $e ) {
             $this->log( 'memberpress: handle_wp_login error', [
                 'error' => $e->getMessage(),
@@ -126,6 +149,30 @@ class MemberPress_Integration {
     // -------------------------------------------------------------------------
     // Core logic
     // -------------------------------------------------------------------------
+
+    private function handle_transaction( $txn, string $hook ): void {
+        $ctx = $this->extract_txn_context( $txn );
+
+        $this->debug( 'hook fired', [
+            'hook'           => $hook,
+            'user_id'        => $ctx['user_id'],
+            'transaction_id' => $ctx['transaction_id'],
+            'membership_id'  => $ctx['membership_id'],
+            'subscription_id'=> $ctx['subscription_id'],
+        ] );
+
+        if ( $ctx['user_id'] <= 0 ) {
+            $this->debug( 'skip: missing user_id', [
+                'hook' => $hook,
+            ] );
+            return;
+        }
+
+        $this->normalize_user_profile( $ctx['user_id'], $hook );
+        $this->provision_from_txn( $txn, $hook );
+        // Créditos MemberPress ahora se gestionan en MemberPress_Credits_Integration
+        // con reglas configurables e idempotencia por transacción.
+    }
 
     private function provision_from_txn( $txn, string $source ): void {
         $user_id = $this->extract_user_id_from_txn( $txn );
@@ -158,6 +205,199 @@ class MemberPress_Integration {
             'vertical' => $vertical,
             'post_id'  => $post_id,
         ] );
+    }
+
+    /**
+     * Normaliza display_name y nickname para usuarios nuevos creados desde checkout/registro.
+     * Solo pisa si el valor actual está vacío o parece placeholder de email/username.
+     */
+    private function normalize_user_profile( int $user_id, string $hook ): void {
+        $user = get_user_by( 'id', $user_id );
+        if ( ! $user ) {
+            $this->debug( 'skip profile normalize: user not found', [
+                'hook'    => $hook,
+                'user_id' => $user_id,
+            ] );
+            return;
+        }
+
+        $email_local = $this->email_local_part( (string) $user->user_email );
+        $first_name  = trim( (string) get_user_meta( $user_id, 'first_name', true ) );
+        $last_name   = trim( (string) get_user_meta( $user_id, 'last_name', true ) );
+
+        $full = trim( $first_name . ' ' . $last_name );
+        if ( $full === '' ) {
+            $full = $first_name !== '' ? $first_name : $last_name;
+        }
+        if ( $full === '' ) {
+            $full = $email_local !== '' ? $email_local : (string) $user->user_login;
+        }
+
+        $should_update_display = $this->is_placeholder_identity_value(
+            (string) $user->display_name,
+            (string) $user->user_email,
+            (string) $user->user_login
+        );
+
+        $nickname = (string) get_user_meta( $user_id, 'nickname', true );
+        $should_update_nickname = $this->is_placeholder_identity_value(
+            $nickname,
+            (string) $user->user_email,
+            (string) $user->user_login
+        );
+
+        $updates = [ 'ID' => $user_id ];
+        $has_updates = false;
+
+        if ( $should_update_display ) {
+            $updates['display_name'] = $full;
+            $slug = sanitize_title( $full );
+            if ( $slug !== '' ) {
+                $updates['user_nicename'] = $slug;
+            }
+            $has_updates = true;
+        }
+
+        if ( $should_update_nickname ) {
+            update_user_meta( $user_id, 'nickname', $full );
+        }
+
+        if ( $has_updates ) {
+            wp_update_user( $updates );
+        }
+
+        $this->debug( 'profile normalized', [
+            'hook'            => $hook,
+            'user_id'         => $user_id,
+            'display_updated' => $has_updates,
+            'nickname_updated'=> $should_update_nickname,
+            'resolved_name'   => $full,
+        ] );
+    }
+
+    private function assign_initial_credits( array $ctx, string $hook ): void {
+        $user_id        = (int) $ctx['user_id'];
+        $transaction_id = (string) $ctx['transaction_id'];
+        $subscription_id= (string) $ctx['subscription_id'];
+        $membership_id  = (int) $ctx['membership_id'];
+
+        if ( $membership_id <= 0 ) {
+            $this->debug( 'skip credits: membership_id missing', [
+                'hook'           => $hook,
+                'user_id'        => $user_id,
+                'transaction_id' => $transaction_id,
+            ] );
+            return;
+        }
+
+        $map = $this->get_credits_map();
+        if ( ! isset( $map[ $membership_id ] ) ) {
+            $this->debug( 'skip credits: membership not mapped', [
+                'hook'           => $hook,
+                'user_id'        => $user_id,
+                'transaction_id' => $transaction_id,
+                'membership_id'  => $membership_id,
+            ] );
+            return;
+        }
+
+        $amount = $this->normalize_decimal_6( $map[ $membership_id ] );
+        if ( (float) $amount <= 0.0 ) {
+            $this->debug( 'skip credits: mapped amount <= 0', [
+                'hook'           => $hook,
+                'user_id'        => $user_id,
+                'transaction_id' => $transaction_id,
+                'membership_id'  => $membership_id,
+                'amount'         => $amount,
+            ] );
+            return;
+        }
+
+        $markers = $this->idempotency_markers( $transaction_id, $subscription_id );
+        if ( empty( $markers ) ) {
+            $this->debug( 'skip credits: missing tx/sub id for idempotency', [
+                'hook'           => $hook,
+                'user_id'        => $user_id,
+                'transaction_id' => $transaction_id,
+                'subscription_id'=> $subscription_id,
+            ] );
+            return;
+        }
+
+        foreach ( $markers as $marker ) {
+            if ( get_user_meta( $user_id, $marker, true ) !== '' ) {
+                $this->debug( 'skip credits: already granted', [
+                    'hook'           => $hook,
+                    'user_id'        => $user_id,
+                    'transaction_id' => $transaction_id,
+                    'membership_id'  => $membership_id,
+                    'marker'         => $marker,
+                ] );
+                return;
+            }
+        }
+
+        $prev = $this->get_balance_decimal( $user_id );
+        $new  = $this->decimal_add( $prev, $amount );
+
+        update_user_meta( $user_id, self::KURUKIN_CREDITS_BALANCE, $new );
+
+        foreach ( $markers as $marker ) {
+            update_user_meta( $user_id, $marker, time() );
+        }
+
+        $ref = $transaction_id !== '' ? 'mepr_txn:' . $transaction_id : 'mepr_sub:' . $subscription_id;
+        $user = get_user_by( 'id', $user_id );
+        $login = $user ? (string) $user->user_login : '';
+
+        if ( class_exists( '\Kurukin\Core\Services\Credits_Service' ) ) {
+            \Kurukin\Core\Services\Credits_Service::log_credit_movement( [
+                'user_id'        => $user_id,
+                'user_login'     => $login,
+                'type'           => 'memberpress_initial_credit',
+                'amount'         => $amount,
+                'currency'       => 'USD',
+                'balance_before' => $prev,
+                'balance_after'  => $new,
+                'source'         => 'memberpress',
+                'ref'            => $ref,
+                'note'           => 'memberpress_initial_credit',
+            ] );
+        }
+
+        $this->debug( 'credits assigned', [
+            'hook'           => $hook,
+            'user_id'        => $user_id,
+            'transaction_id' => $transaction_id,
+            'membership_id'  => $membership_id,
+            'amount'         => $amount,
+            'balance_before' => $prev,
+            'balance_after'  => $new,
+        ] );
+    }
+
+    private function get_credits_map(): array {
+        $map = [
+            // membership_id => initial_credits
+            // 123 => '10.000000',
+            // 124 => '100.000000',
+        ];
+
+        $map = apply_filters( 'kurukin_mp_credits_map', $map );
+        if ( ! is_array( $map ) ) {
+            return [];
+        }
+
+        $normalized = [];
+        foreach ( $map as $membership_id => $credits ) {
+            $membership_id = (int) $membership_id;
+            if ( $membership_id <= 0 ) {
+                continue;
+            }
+            $normalized[ $membership_id ] = $this->normalize_decimal_6( $credits );
+        }
+
+        return $normalized;
     }
 
     /**
@@ -255,6 +495,118 @@ class MemberPress_Integration {
         return 0;
     }
 
+    private function extract_txn_context( $txn ): array {
+        $ctx = [
+            'user_id'        => 0,
+            'transaction_id' => '',
+            'subscription_id'=> '',
+            'membership_id'  => 0,
+        ];
+
+        if ( ! is_object( $txn ) && ! is_array( $txn ) ) {
+            return $ctx;
+        }
+
+        $ctx['user_id'] = (int) $this->read_txn_value( $txn, [ 'user_id' ] );
+
+        $transaction_id = $this->read_txn_value( $txn, [ 'id', 'trans_num', 'transaction_id' ] );
+        $ctx['transaction_id'] = is_scalar( $transaction_id ) ? (string) $transaction_id : '';
+
+        $subscription_id = $this->read_txn_value( $txn, [ 'subscription_id' ] );
+        $ctx['subscription_id'] = is_scalar( $subscription_id ) ? (string) $subscription_id : '';
+
+        $membership_id = $this->read_txn_value( $txn, [ 'product_id', 'membership_id' ] );
+        $ctx['membership_id'] = (int) $membership_id;
+
+        return $ctx;
+    }
+
+    private function read_txn_value( $txn, array $keys ) {
+        foreach ( $keys as $key ) {
+            if ( is_array( $txn ) && array_key_exists( $key, $txn ) ) {
+                return $txn[ $key ];
+            }
+
+            if ( is_object( $txn ) && isset( $txn->{$key} ) ) {
+                return $txn->{$key};
+            }
+
+            if ( is_object( $txn ) && method_exists( $txn, $key ) ) {
+                return $txn->{$key}();
+            }
+        }
+
+        return null;
+    }
+
+    private function email_local_part( string $email ): string {
+        $at = strpos( $email, '@' );
+        if ( $at === false ) {
+            return sanitize_text_field( $email );
+        }
+        return sanitize_text_field( substr( $email, 0, $at ) );
+    }
+
+    private function is_placeholder_identity_value( string $value, string $email, string $login ): bool {
+        $value = trim( $value );
+        if ( $value === '' ) {
+            return true;
+        }
+
+        $email_local = $this->email_local_part( $email );
+        $candidates = [
+            strtolower( $email ),
+            strtolower( $login ),
+            strtolower( $email_local ),
+        ];
+
+        return in_array( strtolower( $value ), $candidates, true );
+    }
+
+    private function idempotency_markers( string $transaction_id, string $subscription_id ): array {
+        $markers = [];
+
+        if ( $transaction_id !== '' ) {
+            $markers[] = self::TX_META_PREFIX . substr( hash( 'sha256', $transaction_id ), 0, 24 );
+        }
+
+        if ( $subscription_id !== '' ) {
+            $markers[] = self::SUB_META_PREFIX . substr( hash( 'sha256', $subscription_id ), 0, 24 );
+        }
+
+        return $markers;
+    }
+
+    private function normalize_decimal_6( $value ): string {
+        if ( class_exists( '\Kurukin\Core\Services\Credits_Service' ) ) {
+            return \Kurukin\Core\Services\Credits_Service::normalize_decimal_6( $value );
+        }
+
+        if ( is_string( $value ) ) {
+            $value = str_replace( ',', '.', trim( $value ) );
+            $value = preg_replace( '/[^0-9\.\-]/', '', $value );
+        }
+
+        return sprintf( '%.6F', (float) $value );
+    }
+
+    private function get_balance_decimal( int $user_id ): string {
+        if ( class_exists( '\Kurukin\Core\Services\Credits_Service' ) ) {
+            return \Kurukin\Core\Services\Credits_Service::get_balance_decimal( $user_id );
+        }
+
+        $raw = get_user_meta( $user_id, self::KURUKIN_CREDITS_BALANCE, true );
+        return $this->normalize_decimal_6( $raw );
+    }
+
+    private function decimal_add( $a, $b ): string {
+        if ( class_exists( '\Kurukin\Core\Services\Credits_Service' ) ) {
+            return \Kurukin\Core\Services\Credits_Service::decimal_add( $a, $b );
+        }
+
+        return sprintf( '%.6F', ( (float) $a + (float) $b ) );
+    }
+
     private function ensure_saas_instance_for_user( int $user_id ): int {
         // Si existe Tenant_Service, lo usamos como fuente de verdad
         $tenant_class = 'Kurukin\\Core\\Services\\Tenant_Service';
@@ -309,5 +661,13 @@ class MemberPress_Integration {
         if ( class_exists( $logger_class ) && method_exists( $logger_class, 'log' ) ) {
             $logger_class::log( $message, $context );
         }
+    }
+
+    private function debug( string $message, array $context = [] ): void {
+        $line = self::LOG_PREFIX . ' ' . $message;
+        if ( ! empty( $context ) ) {
+            $line .= ' | ' . wp_json_encode( $context, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE );
+        }
+        error_log( $line );
     }
 }

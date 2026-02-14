@@ -105,14 +105,16 @@ class Connection_Controller extends WP_REST_Controller {
 
             // ✅ IMPORTANT: map WP_Error to a stable UI response
             if ( is_wp_error( $res ) ) {
-                $msg  = $res->get_error_message();
-                $code = $res->get_error_code();
+                $mapped = $this->map_service_error( $res, 'status' );
+                $data   = $mapped->get_error_data();
 
                 // Keep response stable for frontend Badge/status handling
                 return [
                     'state'   => 'network_error',
-                    'message' => $msg !== '' ? $msg : 'Network error',
-                    'code'    => (string) $code,
+                    'message' => (string) $mapped->get_error_message(),
+                    'code'    => (string) $mapped->get_error_code(),
+                    'upstream_status' => (int) ( $data['upstream_status'] ?? 0 ),
+                    'hint'    => (string) ( $data['hint'] ?? '' ),
                 ];
             }
 
@@ -134,7 +136,9 @@ class Connection_Controller extends WP_REST_Controller {
             }
 
             $res = $this->evolution->connect_and_get_qr( $user_id );
-            if ( is_wp_error( $res ) ) return $res;
+            if ( is_wp_error( $res ) ) {
+                return $this->map_service_error( $res, 'qr' );
+            }
 
             // Respuesta estable: base64, code
             return is_array( $res ) ? $res : [ 'base64' => null, 'message' => 'Unexpected response' ];
@@ -154,7 +158,9 @@ class Connection_Controller extends WP_REST_Controller {
             }
 
             $res = $this->evolution->reset_instance( $user_id );
-            if ( is_wp_error( $res ) ) return $res;
+            if ( is_wp_error( $res ) ) {
+                return $this->map_service_error( $res, 'reset' );
+            }
 
             return is_array( $res ) ? $res : [ 'ok' => true ];
 
@@ -171,5 +177,73 @@ class Connection_Controller extends WP_REST_Controller {
         if ( ! $this->evolution instanceof Evolution_Service ) {
             throw new \RuntimeException( 'Evolution_Service not available (autoload/include failed).' );
         }
+    }
+
+    private function map_service_error( WP_Error $error, string $operation ): WP_Error {
+        $original_code = (string) $error->get_error_code();
+        $original_msg  = (string) $error->get_error_message();
+        $data          = $error->get_error_data();
+        $data          = is_array( $data ) ? $data : [];
+
+        $upstream_status = isset( $data['upstream_status'] ) ? (int) $data['upstream_status'] : 0;
+        if ( $upstream_status <= 0 && preg_match( '/\((\d{3})\)/', $original_msg, $m ) ) {
+            $upstream_status = (int) $m[1];
+        }
+
+        $hint = isset( $data['hint'] ) ? (string) $data['hint'] : '';
+        $status = isset( $data['status'] ) ? (int) $data['status'] : 500;
+        $public_code = $original_code !== '' ? $original_code : 'kurukin_connection_error';
+        $public_message = $original_msg !== '' ? $original_msg : 'Error de conexión con Evolution.';
+
+        if ( $upstream_status === 401 || $original_code === 'kurukin_upstream_unauthorized' ) {
+            $public_code = 'kurukin_upstream_unauthorized';
+            $public_message = 'No autorizado con Evolution, revisa key/host.';
+            $hint = $hint !== '' ? $hint : 'Revisa KURUKIN_EVOLUTION_GLOBAL_KEY o la API key asignada al tenant.';
+            $status = 502;
+        } elseif ( $original_code === 'kurukin_missing_routing' ) {
+            $public_message = 'Configuración incompleta para conectar con Evolution.';
+            $hint = $hint !== '' ? $hint : 'Valida endpoint, instance_id y API key.';
+            $status = 500;
+        } elseif ( $original_code === 'kurukin_qr_timeout' ) {
+            $public_message = 'No se pudo obtener el QR a tiempo. Intenta nuevamente.';
+            $hint = $hint !== '' ? $hint : 'La instancia puede estar iniciando en Evolution.';
+            $status = 504;
+        } elseif ( $operation === 'qr' ) {
+            $public_message = 'No se pudo obtener QR en este momento.';
+            if ( $hint === '' ) {
+                $hint = 'Revisa conectividad y credenciales de Evolution.';
+            }
+            if ( $status < 400 ) {
+                $status = 502;
+            }
+        }
+
+        if ( defined( 'WP_DEBUG' ) && WP_DEBUG ) {
+            error_log(
+                '[Kurukin][Connection] Error ' . $operation . ' | ' .
+                wp_json_encode(
+                    [
+                        'code'            => $public_code,
+                        'message'         => $public_message,
+                        'upstream_status' => $upstream_status,
+                        'hint'            => $hint,
+                        'original_code'   => $original_code,
+                        'original_message'=> $original_msg,
+                    ],
+                    JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES
+                )
+            );
+        }
+
+        return new WP_Error(
+            $public_code,
+            $public_message,
+            [
+                'status'          => $status,
+                'upstream_status' => $upstream_status,
+                'hint'            => $hint,
+                'original_code'   => $original_code,
+            ]
+        );
     }
 }
